@@ -1,0 +1,8 @@
+streamlit-shap==1.0.2
+langchain==0.3.27
+sentence-transformers==3.3.1
+tf_keras==2.17.0
+joblib==1.4.2
+requests==2.32.3
+python-dotenv==1.1.0
+langchain_openai==0.3.33

@@ -1,0 +1,26 @@
+input/*
+output/*
+.env
+
+# Ignore Python cache and compiled files
+__pycache__/*
+*/__pycache__/*
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore environment files
+.env
+venv/*
+*.env
+.idea/*
+
+# Ignore data and artifacts
+*.db
+*.sqlite3
+*.h5
+*.hdf5
+*.ckpt
+*.weights
+
+cheatsheet

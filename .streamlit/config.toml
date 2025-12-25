@@ -1,0 +1,7 @@
+[theme]
+base="dark"
+primaryColor="#8A2BE2"         # Bold electric purple for accents
+backgroundColor="#0E1117"      # Deep charcoal for modern dark mode
+secondaryBackgroundColor="#1E1E2E"  # Subtle contrast panels
+textColor="#FFFFFF"            # Clean white text
+font="monospace"               # Techy data/AI vibe

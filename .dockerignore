@@ -1,0 +1,42 @@
+# Ignore Python cache and compiled files
+__pycache__/*
+*/__pycache__/*
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore environment files
+.env
+venv/*
+*.env
+.idea/*
+
+# Ignore data and artifacts
+*.db
+*.sqlite3
+*.h5
+*.hdf5
+*.ckpt
+*.weights
+
+
+# Ignore any local Dockerfiles or images you don't want bundled
+docker-compose.yml
+Dockerfile*
+
+# Ignore version control folders
+.git/
+.gitignore
+
+# Ignore other unnecessary files
+*.tar
+*.zip
+*.gz
+*.whl
+dist/*
+build/*
+*.egg-info/*
+
+input/*
+output/*
+cheatsheet

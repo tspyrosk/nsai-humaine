@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  nsl-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8888:8888"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASS=${MINIO_PASS}
+#    volumes:
+#      - ./input:/app/input
+#      - ./output:/app/output
+    restart: unless-stopped

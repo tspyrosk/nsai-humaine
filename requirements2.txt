@@ -1,0 +1,8 @@
+keras==3.5.0
+ltn==2.1
+outlines==0.2.1
+outlines[openai]==0.2.1
+transformers==4.47.0
+streamlit==1.44.0
+matplotlib==3.7.5
+shap==0.47.1
