@@ -42,5 +42,9 @@ ENV STREAMLIT_GLOBAL_DISABLEWATCHDOGWARNING=true
 
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 
+RUN mkdir -p /app/input
+RUN mkdir -p /app/output
+
+
 # For UI
 CMD ["streamlit", "run", "/app/main.py", "--server.port=8888"]

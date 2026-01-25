@@ -1,21 +1,22 @@
 import os
-import tensorflow as tf
-from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
-from sklearn.metrics import classification_report
+import zipfile
+import tempfile
+import shutil
 import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_shap import st_shap
-import matplotlib.pyplot as plt
 import shap
 import absl.logging
-import os
 import dataset.minio_utils as minio_utils
-from predicates_definition.predicate_gen_utils import generate_python_code
-from utils import collect_predicate_names, remove_rules_and_predicates, remove_outputs, remove_rules
+from utils import remove_rules_and_predicates, remove_outputs, remove_rules
 from dotenv import dotenv_values
 import io
 from paths import *
+
+# Import business logic services
+from services import data_service, model_service, explanation_service, predicate_service, image_service
+from PIL import Image
 
 absl.logging.set_verbosity(absl.logging.ERROR)
 
@@ -60,6 +61,12 @@ def init_state():
         st.session_state.y_test = None
     if 'processed_df' not in st.session_state:
         st.session_state.processed_df = None
+    if 'image_metadata' not in st.session_state:
+        st.session_state.image_metadata = None
+    if 'dataset_type' not in st.session_state:
+        st.session_state.dataset_type = None
+    if 'extracted_dataset_path' not in st.session_state:
+        st.session_state.extracted_dataset_path = None
     init_predicates_state()
     st.cache_data.clear()
 
@@ -70,6 +77,12 @@ def reset_state():
     st.session_state.X_test = None
     st.session_state.y_test = None
     st.session_state.processed_df = None
+    st.session_state.image_metadata = None
+    st.session_state.dataset_type = None
+    # Clean up extracted dataset directory if it exists
+    if st.session_state.get('extracted_dataset_path') and os.path.exists(st.session_state.extracted_dataset_path):
+        shutil.rmtree(st.session_state.extracted_dataset_path, ignore_errors=True)
+    st.session_state.extracted_dataset_path = None
     st.session_state.rules = []
     reset_predicates_state()
     st.cache_data.clear()
@@ -91,139 +104,11 @@ if st.sidebar.button("Reset All"):
 
 init_state()
 
-@st.cache_data
-def load_data(target, cols_to_drop):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
-    os.makedirs(TEST_DATA_DIR, exist_ok=True)
-    drop = ",".join(cols_to_drop)
-    os.system(f"python {SPLIT_DATASET_SCRIPT} --input_file_path={INPUT_CSV} --output_path={OUTPUT_DIR} --seed={GLOBAL_SEED} --sample_ratio={SAMPLE_RATIO} --target_column=\"{target}\" --drop=\"{drop}\"")
-    return True
-
-
-def get_feature_names():
-    path = FEATURE_NAMES_PATH
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            loaded_features = [line.strip() for line in f]
-            return loaded_features
-    return []
-
-def get_predicted_class(pred):
-    if pred>0.5:
-        cl = st.session_state.target_column.lower()
-    else:
-        cl = f"no {st.session_state.target_column.lower()}"
-    return cl
-
-def run_training_pipeline():
-    os.system(f"python {BASE_DIR}/models/train_ltn.py --input_path={OUTPUT_DIR} --seed={GLOBAL_SEED} --use_rules=1 --rules_file_path={LTN_RULES_PATH} --epochs={TRAIN_EPOCHS}")
-    os.system(f"python {BASE_DIR}/models/train_ltn.py --input_path={OUTPUT_DIR} --seed={GLOBAL_SEED} --epochs={TRAIN_EPOCHS}")
-
-class RulesModel:
-    def __init__(self):
-        self.name = "RULES"
-
-    def score_samples(self, X, y):
-        import models.create_rules_only as create_rules_only
-        return create_rules_only.predict(X, y)
-
-    def predict(self, X, y):
-        preds = self.score_samples(X, y)
-        return preds >= 0.5
-
-class InferenceModel:
-    def __init__(self, model_name):
-        self.base_model = tf.keras.models.load_model(f'{OUTPUT_DIR}/{model_name}.h5')
-        self.name = model_name.upper()
-
-    def score_samples(self, X, y):
-        return self.base_model(X)
-
-    def predict(self, X, y):
-        preds = self.score_samples(X, y)
-        return (preds > 0.5)
-
-global models
-
-def run_all_exps():
-    all_shap_values = []
-    results = {}
-
-    run_training_pipeline()
-    models = [
-        RulesModel(),
-        InferenceModel("mlp"),
-        InferenceModel("ltn")
-    ]
-
-    for model in models:
-        yp = model.predict(st.session_state.X_test, st.session_state.y_test)
-        f1 = f1_score(st.session_state.y_test, yp)
-
-        acc = balanced_accuracy_score(st.session_state.y_test, yp)
-        auroc = roc_auc_score(st.session_state.y_test, model.score_samples(st.session_state.X_test, st.session_state.y_test), multi_class='ovr', average='weighted')
-        report = classification_report(st.session_state.y_test, yp, output_dict=True)
-        prec = report[str(1)]['precision']
-        recall = report[str(1)]['recall']
-
-        results[model.name] = {'Accuracy': acc,
-                                     'AUROC': auroc,
-                                     'F1': f1,
-                                     'Precision': prec,
-                                     'Recall': recall}
-    return results
-
-
-def explain_predictions(model_to_exp, x):
-    def f(x):
-        return model_to_exp.score_samples(x, np.zeros(x.shape[0]))
-
-    explainer = shap.KernelExplainer(f, st.session_state.X_train)
-    shap_values = explainer.shap_values(x)
-    return shap_values
-
-
-def predict_and_explain_random(x, y):
-    trained_models = [
-        RulesModel(),
-        InferenceModel("mlp"),
-        InferenceModel("ltn")
-    ]
-
-    collected_shap_values = []
-    scores = {}
-    for trained_model in trained_models:
-        pred = trained_model.score_samples(np.expand_dims(x, axis=0), [y])
-        scores[trained_model.name] = pred[0]
-        shap_values = explain_predictions(trained_model, np.expand_dims(x, axis = 0))
-        collected_shap_values.append(shap_values[0])
-    import models.create_rules_only as create_rules_only
-    rules_triggered = create_rules_only.get_satisfied_rule_indexes(x, y)
-    concepts = create_rules_only.satisfied_concepts(x)
-    important_features = top_3_shap_features(collected_shap_values[2])
-    table_contents = pd.DataFrame(scores, index=['value']).transpose()
-    st.subheader('Predictions:')
-    st.table(table_contents)
-
-    st.subheader('Feature Importance:')
-    decision_plot(collected_shap_values[2].flatten(), x)
-
-    if (len(rules_triggered) > 0) and (len(selected_rules) > 0):
-        st.subheader('Rules Triggered:')
-        for rule_idx in rules_triggered:
-            st.write(selected_rules[rule_idx])
-
-    st.subheader('Summary:')
-    import models.xai_rag as xai_rag
-    rag_explanation = xai_rag.extract_rag_explanation(concepts, important_features, get_predicted_class(scores["LTN"]))
-    st.markdown(rag_explanation)
-
-def top_3_shap_features(shap_values):
-    top_3_idx = np.argsort(shap_values, axis=0)[-3:][::-1].tolist()
-    return [get_feature_names()[idx[0]] for idx in top_3_idx]
 def decision_plot(collected_shap_values, X_test):
-    st_shap(shap.decision_plot(0.5, collected_shap_values, features=X_test, feature_names=get_feature_names()), height=500, width=800)
+    """Display SHAP decision plot."""
+    st_shap(shap.decision_plot(0.5, collected_shap_values, features=X_test,
+                                feature_names=data_service.get_feature_names()),
+            height=500, width=800)
 
 
 def write_results(results, model_name, result_name, comp_model_name=None):
@@ -258,17 +143,19 @@ tab1, tab2, tab3, tab4 = st.tabs(["Load", "Predicates", "Train", "Explain"])
 
 with tab1:
     st.header("Upload Dataset")
-    
-    upload_method = st.radio("Choose data source", ["Upload CSV", "MinIO Path"])
-    
+
+    upload_method = st.radio("Choose data source", ["Upload CSV", "MinIO Path", "Image Dataset"])
+
     if upload_method == "Upload CSV":
         uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
         if uploaded_file is not None:
-            os.makedirs(INPUT_DIR, exist_ok=True)
-            with open(INPUT_CSV, "wb") as f:
-                f.write(uploaded_file.getbuffer())  
-            st.session_state.df = pd.read_csv(INPUT_CSV)  
-    else:
+            st.session_state.df = data_service.save_uploaded_csv(
+                uploaded_file.getbuffer(),
+                INPUT_CSV
+            )
+            st.session_state.dataset_type = "csv"
+
+    elif upload_method == "MinIO Path":
         minio_path = st.text_input("Enter MinIO Path")
         if st.button("Load from MinIO"):
             if minio_path:
@@ -278,29 +165,175 @@ with tab1:
                     print(f"Reading from MinIO. Bucket: {bucket}, rePath: {path}")
                     minio_utils.minio_download(minio_utils.TOKEN, bucket, path, INPUT_CSV)
                     st.session_state.df = pd.read_csv(INPUT_CSV)
+                    st.session_state.dataset_type = "csv"
                 except Exception as e:
                     st.error(f"Error loading data from MinIO: {str(e)}")
             else:
                 st.warning("Please enter a valid MinIO path.")
-    
+
+    else:  # Image Dataset
+        st.subheader("Load Image Dataset")
+        st.info("Upload a ZIP file containing two folders (one for each class). "
+                "Example structure: `dataset.zip` → `class_a/` and `class_b/` folders with images inside.")
+
+        uploaded_zip = st.file_uploader("Upload ZIP file with image dataset", type=["zip"])
+
+        if uploaded_zip is not None:
+            # Create a persistent directory for the extracted dataset
+            dataset_name = os.path.splitext(uploaded_zip.name)[0]
+            dataset_path = os.path.join(INPUT_DIR, f"uploaded_{dataset_name}")
+
+            # Check if we need to extract (avoid re-extracting on every rerun)
+            if 'extracted_dataset_path' not in st.session_state or st.session_state.extracted_dataset_path != dataset_path:
+                # Clean up previous extraction if exists
+                if os.path.exists(dataset_path):
+                    shutil.rmtree(dataset_path)
+
+                # Extract ZIP file
+                with st.spinner("Extracting ZIP file..."):
+                    os.makedirs(dataset_path, exist_ok=True)
+                    with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()), 'r') as zip_ref:
+                        zip_ref.extractall(dataset_path)
+
+                    # Handle case where ZIP contains a single root folder
+                    extracted_items = [f for f in os.listdir(dataset_path) if not f.startswith('.')]
+                    if len(extracted_items) == 1:
+                        single_folder = os.path.join(dataset_path, extracted_items[0])
+                        if os.path.isdir(single_folder):
+                            # Move contents up one level
+                            for item in os.listdir(single_folder):
+                                shutil.move(os.path.join(single_folder, item), dataset_path)
+                            os.rmdir(single_folder)
+
+                st.session_state.extracted_dataset_path = dataset_path
+                st.success(f"ZIP extracted to: {dataset_path}")
+
+            # Load and display the dataset
+            try:
+                image_paths, labels, class_names = image_service.load_image_dataset(dataset_path)
+
+                st.write(f"**Classes:** {', '.join(class_names)}")
+                st.write(f"**Total images:** {len(image_paths)} "
+                        f"(Class 0: {len(labels) - sum(labels)}, Class 1: {sum(labels)})")
+
+                # Display sample images from each class
+                st.subheader("Sample Images")
+                samples = image_service.get_sample_images(image_paths, labels, n_per_class=4)
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.write(f"**{class_names[0] if labels[0] == 0 else class_names[1]}** (Class 0 - Negative)")
+                    sample_cols = st.columns(4)
+                    for idx, img_path in enumerate(samples.get(0, [])[:4]):
+                        with sample_cols[idx]:
+                            img = Image.open(img_path)
+                            st.image(img, use_container_width=True)
+
+                with col2:
+                    positive_class_name = class_names[1] if labels[0] == 0 else class_names[0]
+                    st.write(f"**{positive_class_name}** (Class 1 - Positive)")
+                    sample_cols = st.columns(4)
+                    for idx, img_path in enumerate(samples.get(1, [])[:4]):
+                        with sample_cols[idx]:
+                            img = Image.open(img_path)
+                            st.image(img, use_container_width=True)
+
+                # Option to force refresh cache
+                force_refresh = st.checkbox("Force refresh (re-extract all features)", value=False)
+
+                # Check if OpenAI API key is available
+                openai_key = os.getenv("OPENAI_API_KEY")
+                if not openai_key:
+                    st.info("OpenAI API key not found. Tag extraction will be skipped. "
+                           "Upload a .env file with OPENAI_API_KEY to enable tag extraction.")
+
+                # Process button
+                if st.button("Process Image Dataset"):
+                    with st.spinner("Processing images..."):
+                        # Progress indicators
+                        progress_text = st.empty()
+                        progress_bar = st.progress(0)
+
+                        def update_progress(current, total, stage=""):
+                            progress = current / total if total > 0 else 1.0
+                            progress_bar.progress(progress)
+                            progress_text.text(f"{stage}: {current}/{total}")
+
+                        try:
+                            # Extract features and create tabular dataset
+                            df, metadata = image_service.load_image_dataset_as_tabular(
+                                dataset_path,
+                                openai_api_key=openai_key,
+                                force_refresh=force_refresh,
+                                tag_progress_callback=lambda c, t: update_progress(c, t, "Extracting tags"),
+                                feature_progress_callback=lambda c, t: update_progress(c, t, "Extracting image features")
+                            )
+
+                            # Save as CSV for compatibility with existing data flow
+                            df.to_csv(INPUT_CSV, index=False)
+
+                            # Store in session state
+                            st.session_state.df = df
+                            st.session_state.image_metadata = metadata
+                            st.session_state.dataset_type = "image"
+
+                            progress_bar.progress(1.0)
+                            progress_text.text("Processing complete!")
+
+                            st.success(f"Image dataset converted to tabular format! "
+                                      f"({len(metadata['all_tags'])} tag features + "
+                                      f"{len(metadata['image_feature_names'])} image features)")
+
+                        except Exception as e:
+                            st.error(f"Error processing image dataset: {str(e)}")
+
+            except Exception as e:
+                st.error(f"Error loading image dataset: {str(e)}")
+
+    # Common section for all data sources - display DataFrame and configure
     if st.session_state.df is not None:
+        st.divider()
+        st.subheader("Dataset Preview")
         st.write(st.session_state.df.head())
 
+        # For image datasets, show metadata
+        if st.session_state.dataset_type == "image" and st.session_state.image_metadata:
+            meta = st.session_state.image_metadata
+            with st.expander("Image Dataset Details"):
+                st.write(f"**Tag features:** {len(meta['all_tags'])}")
+                st.write(f"**Image features:** {len(meta['image_feature_names'])}")
+                st.write(f"**Sample tags:** {', '.join(meta['all_tags'][:10])}...")
+
         columns = st.session_state.df.columns.tolist()
-        columns_to_drop = st.multiselect("Select columns to drop", columns)
-        st.session_state.target_column = st.selectbox("Select target column", columns)
-    
+
+        # Filter out non-feature columns for dropping
+        droppable_columns = [c for c in columns if c not in ['image_path']]
+        columns_to_drop = st.multiselect("Select columns to drop", droppable_columns)
+
+        # For image datasets, default target to 'label'
+        default_target_idx = columns.index('label') if 'label' in columns else 0
+        st.session_state.target_column = st.selectbox("Select target column", columns, index=default_target_idx)
+
         if st.button("Apply"):
-            loaded = load_data(st.session_state.target_column, columns_to_drop)
-            st.session_state.X_train = np.load(f'{TRAIN_DATA_DIR}/X_{GLOBAL_SEED}.npy')
-            st.session_state.X_test = np.load(f'{TEST_DATA_DIR}/X_{GLOBAL_SEED}.npy')
-            st.session_state.y_test = np.load(f'{TEST_DATA_DIR}/y_{GLOBAL_SEED}.npy')
-    
+            # Always drop image_path if it exists (not a feature)
+            cols_to_drop = columns_to_drop.copy()
+            if 'image_path' in columns and 'image_path' not in cols_to_drop:
+                cols_to_drop.append('image_path')
+
+            X_train, X_test, y_test, processed_df = data_service.load_data_from_csv(
+                INPUT_CSV,
+                st.session_state.target_column,
+                cols_to_drop,
+                GLOBAL_SEED,
+                SAMPLE_RATIO
+            )
+            st.session_state.X_train = X_train
+            st.session_state.X_test = X_test
+            st.session_state.y_test = y_test
+            st.session_state.processed_df = processed_df
+
             st.success("Train and test sets loaded into session state!")
-            
-            with open(FEATURE_NAMES_PATH, 'r') as file:
-                new_cols = [line.strip() for line in file if line.strip()]
-            st.session_state.processed_df = pd.DataFrame(np.concatenate((st.session_state.X_train, st.session_state.X_test), axis=0), columns=new_cols)
 
 
 with tab2:
@@ -310,34 +343,29 @@ with tab2:
         st.subheader("Defined Predicates")
         if st.session_state.predicates:
             st.write("Simple Predicates:")
-            #print(st.session_state.predicates)
             for pred in st.session_state.predicates:
                 st.write(f"{pred['name']}: Column {pred['column_index']}, {pred['comparison']} {pred['threshold']}")
-    
+
         if st.session_state.composite_predicates:
             st.write("Composite Predicates:")
             for pred in st.session_state.composite_predicates:
                 st.write(f"{pred['name']}: {pred['expression']}")
-        
-        if st.session_state.predicates or st.session_state.composite_predicates:
-            code = generate_python_code(st.session_state.target_column, st.session_state.predicates, st.session_state.composite_predicates)
-            import predicates_definition.lambda_gen_utils as lambda_gen_utils
-            rules_code =lambda_gen_utils.generate_python_code(st.session_state.target_column, st.session_state.predicates, st.session_state.composite_predicates)
-            with open(f"{OUTPUT_DIR}/predicates.txt", "w") as file:
-                file.write(code)
-            with open(f"{OUTPUT_DIR}/lambdas.txt", "w") as file:
-                file.write(rules_code)
-            st.subheader("Generated Code")
-            st.code(code + "\n" + rules_code)
 
-            predicate_names = collect_predicate_names(st.session_state.predicates, st.session_state.composite_predicates, st.session_state.target_column)
-            with open(f"{OUTPUT_DIR}/predicate_names.txt", "w") as file:
-                file.write("\n".join(predicate_names))
-    
+        if st.session_state.predicates or st.session_state.composite_predicates:
+            predicate_code, lambda_code, predicate_names = predicate_service.generate_and_save_predicates(
+                st.session_state.target_column,
+                st.session_state.predicates,
+                st.session_state.composite_predicates
+            )
+            st.subheader("Generated Code")
+            st.code(predicate_code + "\n" + lambda_code)
+
     def name_exists(name):
-        pred_names = [p['name'] for p in st.session_state.predicates]
-        comp_pred_names = [c['name'] for c in st.session_state.composite_predicates]
-        return name in pred_names or name in comp_pred_names
+        return predicate_service.check_predicate_name_exists(
+            name,
+            st.session_state.predicates,
+            st.session_state.composite_predicates
+        )
     
     # Simple Predicate Form
     st.subheader("Create Simple Predicate")
@@ -423,19 +451,18 @@ with tab3:
 
     save_rules = st.button("Save")
     if save_rules:
-        with open(f"{OUTPUT_DIR}/rules_raw.txt", "w") as text_file:
-            text_file.write("\n".join(selected_rules))
-        os.system(f"python {TEXT2RULES_SCRIPT} --raw_rules_path={OUTPUT_DIR}/rules_raw.txt --output_path={OUTPUT_DIR}")
-        with open(f"{OUTPUT_DIR}/rules_only_rules.txt", "r") as file:
-            rules_code = file.read()
-        with open(f"{OUTPUT_DIR}/ltn_rules.txt", "r") as file:
-            ltn_code = file.read()
+        ltn_code, rules_code = predicate_service.save_and_parse_rules(selected_rules)
         st.subheader("Generated Code")
         st.code(ltn_code + "\n" + rules_code)
 
     run = st.button("Train Models")
     if run:
-        results = run_all_exps()
+        results, models = model_service.run_all_experiments(
+            st.session_state.X_test,
+            st.session_state.y_test,
+            GLOBAL_SEED,
+            TRAIN_EPOCHS
+        )
         for (res_name, res_value) in results['MLP'].items():
             create_metric_expander(results, res_name, res_name == 'Accuracy')
 
@@ -446,8 +473,8 @@ with tab4:
         y = st.session_state.y_test[patient_id]
 
         table_contents = pd.DataFrame(
-            dict(zip(get_feature_names(), st.session_state.X_test[patient_id]))
-            , index=[0]
+            dict(zip(data_service.get_feature_names(), st.session_state.X_test[patient_id])),
+            index=[0]
         ).T.reset_index()
         table_contents.columns = ['Feature', 'Value']
 
@@ -456,7 +483,31 @@ with tab4:
         st.markdown(f'**True label:** {y.item()}')
         predict = st.button("Predict!")
         if predict:
-            predict_and_explain_random(x, y)
+            explanation = explanation_service.predict_and_explain(
+                x, y,
+                st.session_state.X_train,
+                st.session_state.target_column,
+                selected_rules
+            )
+
+            # Display predictions
+            table_contents = pd.DataFrame(explanation['scores'], index=['value']).transpose()
+            st.subheader('Predictions:')
+            st.table(table_contents)
+
+            # Display feature importance
+            st.subheader('Feature Importance:')
+            decision_plot(explanation['shap_values'], x)
+
+            # Display satisfied rules
+            if explanation['satisfied_rules']:
+                st.subheader('Rules Triggered:')
+                for rule in explanation['satisfied_rules']:
+                    st.write(rule)
+
+            # Display RAG explanation
+            st.subheader('Summary:')
+            st.markdown(explanation['rag_explanation'])
     else:
         st.warning("Please upload a dataset to get predictions.")
 

@@ -6,3 +6,7 @@ transformers==4.47.0
 streamlit==1.44.0
 matplotlib==3.7.5
 shap==0.47.1
+openai>=1.0.0
+pillow>=10.0.0
+seaborn>=0.12.0
+tqdm>=4.65.0
