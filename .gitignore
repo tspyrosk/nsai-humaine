@@ -11,8 +11,22 @@ __pycache__/*
 
 # Ignore environment files
 .env
-venv/*
 *.env
+
+# Ignore virtual environment directories and files
+venv/*
+.venv/*
+env/*
+ENV/*
+bin/
+lib/
+lib64/
+pyvenv.cfg
+include/
+share/
+etc/
+lib64
+
 .idea/*
 
 # Ignore data and artifacts
@@ -24,3 +38,14 @@ venv/*
 *.weights
 
 cheatsheet
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+*.log

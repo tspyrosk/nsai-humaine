@@ -7,9 +7,23 @@ __pycache__/*
 
 # Ignore environment files
 .env
-venv/*
 *.env
-.idea/*
+
+# Ignore virtual environment directories and files
+venv/
+.venv/
+env/
+ENV/
+bin/
+lib/
+lib64/
+pyvenv.cfg
+include/
+share/
+etc/
+lib64
+
+.idea/
 
 # Ignore data and artifacts
 *.db
@@ -40,3 +54,15 @@ build/*
 input/*
 output/*
 cheatsheet
+
+# Test and coverage artifacts
+tests/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+*.log
