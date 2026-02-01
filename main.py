@@ -15,7 +15,9 @@ import io
 from paths import *
 
 # Import business logic services
-from services import data_service, model_service, explanation_service, predicate_service, image_service
+from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service
+from services.image_service import QuotaExhaustedError as ImageQuotaError
+from services.text_service import QuotaExhaustedError as TextQuotaError
 from PIL import Image
 
 absl.logging.set_verbosity(absl.logging.ERROR)
@@ -30,13 +32,18 @@ TRAIN_EPOCHS = st.sidebar.number_input("Training Epochs:", 1, 2000, 40)
 env_file = st.sidebar.file_uploader("Upload .env file", type=["env"])
 
 if env_file:
-    env_text = env_file.getvalue().decode("utf-8")
-    env_vars = dotenv_values(stream=io.StringIO(env_text))
-    for key, value in env_vars.items():
-        os.environ[key] = value
-    st.sidebar.success(".env loaded from memory")
-    minio_utils.TOKEN = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
-    st.sidebar.success("Obtained MinIO token")
+    # Only process env file once per upload (avoid re-authenticating on every Streamlit rerun)
+    env_file_id = id(env_file.getvalue())
+    if 'env_file_id' not in st.session_state or st.session_state.env_file_id != env_file_id:
+        env_text = env_file.getvalue().decode("utf-8")
+        env_vars = dotenv_values(stream=io.StringIO(env_text))
+        for key, value in env_vars.items():
+            os.environ[key] = value
+        st.session_state.minio_token = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+        st.session_state.env_file_id = env_file_id
+    st.sidebar.success(".env loaded")
+    if st.session_state.minio_token:
+        st.sidebar.success("MinIO authenticated")
 
 def init_predicates_state():
     if 'predicates' not in st.session_state:
@@ -67,6 +74,20 @@ def init_state():
         st.session_state.dataset_type = None
     if 'extracted_dataset_path' not in st.session_state:
         st.session_state.extracted_dataset_path = None
+    if 'text_metadata' not in st.session_state:
+        st.session_state.text_metadata = None
+    if 'text_file_path' not in st.session_state:
+        st.session_state.text_file_path = None
+    if 'dataset_description' not in st.session_state:
+        st.session_state.dataset_description = None
+    if 'test_indices' not in st.session_state:
+        st.session_state.test_indices = None
+    if 'original_image_paths' not in st.session_state:
+        st.session_state.original_image_paths = None
+    if 'original_texts' not in st.session_state:
+        st.session_state.original_texts = None
+    if 'minio_token' not in st.session_state:
+        st.session_state.minio_token = None
     init_predicates_state()
     st.cache_data.clear()
 
@@ -83,6 +104,12 @@ def reset_state():
     if st.session_state.get('extracted_dataset_path') and os.path.exists(st.session_state.extracted_dataset_path):
         shutil.rmtree(st.session_state.extracted_dataset_path, ignore_errors=True)
     st.session_state.extracted_dataset_path = None
+    st.session_state.text_metadata = None
+    st.session_state.text_file_path = None
+    st.session_state.dataset_description = None
+    st.session_state.test_indices = None
+    st.session_state.original_image_paths = None
+    st.session_state.original_texts = None
     st.session_state.rules = []
     reset_predicates_state()
     st.cache_data.clear()
@@ -103,6 +130,13 @@ if st.sidebar.button("Reset All"):
 
 
 init_state()
+
+# Authenticate with MinIO if credentials are in env and we don't have a token yet
+if st.session_state.minio_token is None:
+    _minio_user = os.getenv("MINIO_USER")
+    _minio_pass = os.getenv("MINIO_PASS")
+    if _minio_user and _minio_pass:
+        st.session_state.minio_token = minio_utils.minio_auth(_minio_user, _minio_pass)
 
 def decision_plot(collected_shap_values, X_test):
     """Display SHAP decision plot."""
@@ -144,7 +178,7 @@ tab1, tab2, tab3, tab4 = st.tabs(["Load", "Predicates", "Train", "Explain"])
 with tab1:
     st.header("Upload Dataset")
 
-    upload_method = st.radio("Choose data source", ["Upload CSV", "MinIO Path", "Image Dataset"])
+    upload_method = st.radio("Choose data source", ["Upload CSV", "MinIO Path", "Image Dataset", "Text Dataset"])
 
     if upload_method == "Upload CSV":
         uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
@@ -163,7 +197,7 @@ with tab1:
                     bucket = minio_path.split("/")[0]
                     path = "/".join(minio_path.split("/")[1:])
                     print(f"Reading from MinIO. Bucket: {bucket}, rePath: {path}")
-                    minio_utils.minio_download(minio_utils.TOKEN, bucket, path, INPUT_CSV)
+                    minio_utils.minio_download(st.session_state.minio_token, bucket, path, INPUT_CSV)
                     st.session_state.df = pd.read_csv(INPUT_CSV)
                     st.session_state.dataset_type = "csv"
                 except Exception as e:
@@ -171,7 +205,7 @@ with tab1:
             else:
                 st.warning("Please enter a valid MinIO path.")
 
-    else:  # Image Dataset
+    elif upload_method == "Image Dataset":
         st.subheader("Load Image Dataset")
         st.info("Upload a ZIP file containing two folders (one for each class). "
                 "Example structure: `dataset.zip` → `class_a/` and `class_b/` folders with images inside.")
@@ -239,6 +273,39 @@ with tab1:
                             img = Image.open(img_path)
                             st.image(img, use_container_width=True)
 
+                # Dataset description for tag extraction
+                st.subheader("Dataset Context (Optional)")
+                st.info("Providing context helps extract more relevant tags from images.")
+
+                img_dataset_domain = st.text_input(
+                    "What is this image dataset about?",
+                    value="",
+                    placeholder="e.g., Medical X-rays, Manufacturing defect detection, Satellite imagery",
+                    key="img_domain"
+                )
+                img_row_description = st.text_input(
+                    "What does each image represent?",
+                    value="",
+                    placeholder="e.g., A chest X-ray, A product photo, A satellite image of terrain",
+                    key="img_row_desc"
+                )
+                img_prediction_target = st.text_input(
+                    "What are you trying to classify?",
+                    value="",
+                    placeholder="e.g., Presence of pneumonia, Product defect type, Land use category",
+                    key="img_pred_target"
+                )
+
+                # Build image dataset description
+                img_dataset_description = None
+                if img_dataset_domain or img_row_description or img_prediction_target:
+                    img_dataset_description = {
+                        'domain': img_dataset_domain,
+                        'row_description': img_row_description,
+                        'prediction_target': img_prediction_target,
+                        'class_descriptions': ''
+                    }
+
                 # Option to force refresh cache
                 force_refresh = st.checkbox("Force refresh (re-extract all features)", value=False)
 
@@ -267,8 +334,13 @@ with tab1:
                                 openai_api_key=openai_key,
                                 force_refresh=force_refresh,
                                 tag_progress_callback=lambda c, t: update_progress(c, t, "Extracting tags"),
-                                feature_progress_callback=lambda c, t: update_progress(c, t, "Extracting image features")
+                                feature_progress_callback=lambda c, t: update_progress(c, t, "Extracting image features"),
+                                dataset_description=img_dataset_description
                             )
+
+                            # Store dataset description in session state
+                            if img_dataset_description:
+                                st.session_state.dataset_description = img_dataset_description
 
                             # Save as CSV for compatibility with existing data flow
                             df.to_csv(INPUT_CSV, index=False)
@@ -281,15 +353,194 @@ with tab1:
                             progress_bar.progress(1.0)
                             progress_text.text("Processing complete!")
 
-                            st.success(f"Image dataset converted to tabular format! "
-                                      f"({len(metadata['all_tags'])} tag features + "
-                                      f"{len(metadata['image_feature_names'])} image features)")
+                            # Show success with standardization stats
+                            tag_stats = metadata.get('tag_standardization', {})
+                            if tag_stats and not tag_stats.get('skipped'):
+                                st.success(f"Image dataset converted to tabular format! "
+                                          f"({tag_stats.get('original_count', 0)} tags extracted → "
+                                          f"{len(metadata['all_tags'])} after semantic merging + "
+                                          f"{len(metadata['image_feature_names'])} image features)")
+                            else:
+                                st.success(f"Image dataset converted to tabular format! "
+                                          f"({len(metadata['all_tags'])} tag features + "
+                                          f"{len(metadata['image_feature_names'])} image features)")
 
+                        except ImageQuotaError as e:
+                            st.error("OpenAI API quota exhausted. Please check your billing settings at https://platform.openai.com/account/billing")
                         except Exception as e:
                             st.error(f"Error processing image dataset: {str(e)}")
 
             except Exception as e:
                 st.error(f"Error loading image dataset: {str(e)}")
+
+    elif upload_method == "Text Dataset":
+        st.subheader("Load Text Dataset")
+        st.info("Upload a CSV or TSV file containing text data with labels. "
+                "Example: SMS spam dataset with 'text' and 'label' columns.")
+
+        uploaded_text_file = st.file_uploader("Upload text dataset file (CSV, TSV, or TXT)", type=None)
+
+        if uploaded_text_file is not None:
+            # Save the uploaded file
+            file_name = uploaded_text_file.name
+            file_path = os.path.join(INPUT_DIR, f"uploaded_{file_name}")
+
+            # Check if we need to save (avoid re-saving on every rerun)
+            if 'text_file_path' not in st.session_state or st.session_state.text_file_path != file_path:
+                with open(file_path, 'wb') as f:
+                    f.write(uploaded_text_file.getvalue())
+                st.session_state.text_file_path = file_path
+                st.success(f"File saved to: {file_path}")
+
+            try:
+                # Load and preview the dataset
+                texts, labels, label_names = text_service.load_text_dataset(file_path)
+
+                st.write(f"**Labels:** {', '.join(label_names)}")
+                st.write(f"**Total texts:** {len(texts)} "
+                        f"(Class 0: {len(labels) - sum(labels)}, Class 1: {sum(labels)})")
+
+                # Display sample texts from each class
+                st.subheader("Sample Texts")
+                samples = text_service.get_sample_texts(texts, labels, n_per_class=3)
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.write(f"**{label_names[0]}** (Class 0 - Negative)")
+                    for idx, text in enumerate(samples.get(0, [])[:3]):
+                        with st.expander(f"Sample {idx + 1}", expanded=idx == 0):
+                            st.write(text[:500] + "..." if len(text) > 500 else text)
+
+                with col2:
+                    st.write(f"**{label_names[1] if len(label_names) > 1 else 'Class 1'}** (Class 1 - Positive)")
+                    for idx, text in enumerate(samples.get(1, [])[:3]):
+                        with st.expander(f"Sample {idx + 1}", expanded=idx == 0):
+                            st.write(text[:500] + "..." if len(text) > 500 else text)
+
+                # Dataset description for tag extraction
+                st.subheader("Configuration")
+                st.info("Providing context helps extract more relevant tags and generate better explanations.")
+
+                text_dataset_domain = st.text_input(
+                    "What is this dataset about?",
+                    value="",
+                    placeholder="e.g., SMS spam detection, Email classification, Customer reviews",
+                    key="text_domain"
+                )
+                text_row_description = st.text_input(
+                    "What does each row represent?",
+                    value="",
+                    placeholder="e.g., An SMS message, An email, A customer review",
+                    key="text_row_desc"
+                )
+                text_prediction_target = st.text_input(
+                    "What are you trying to classify?",
+                    value="",
+                    placeholder="e.g., Whether the message is spam, Sentiment of the review",
+                    key="text_pred_target"
+                )
+                text_class_descriptions = st.text_input(
+                    "Describe the classes (optional):",
+                    value="",
+                    placeholder="e.g., ham = legitimate message, spam = unwanted message",
+                    key="text_class_desc"
+                )
+
+                # Build description string for tag extraction
+                dataset_description_parts = []
+                if text_dataset_domain:
+                    dataset_description_parts.append(text_dataset_domain)
+                if text_row_description:
+                    dataset_description_parts.append(f"Each row is {text_row_description}")
+                if text_prediction_target:
+                    dataset_description_parts.append(f"Goal: {text_prediction_target}")
+
+                dataset_description = ". ".join(dataset_description_parts) if dataset_description_parts else "Text messages labeled for binary classification."
+
+                # Build structured dataset description for session state
+                text_dataset_description = {
+                    'domain': text_dataset_domain,
+                    'row_description': text_row_description,
+                    'prediction_target': text_prediction_target,
+                    'class_descriptions': text_class_descriptions
+                }
+
+                # Batch size configuration
+                batch_size = st.number_input(
+                    "Batch size for tag extraction:",
+                    min_value=5, max_value=250, value=150,
+                    help="Number of texts to process in each API call. Higher values are faster but may hit rate limits."
+                )
+
+                # Max tags configuration
+                max_tags = st.number_input(
+                    "Maximum tags to keep:",
+                    min_value=10, max_value=100, value=30,
+                    help="Similar tags are merged and only the top N most discriminative tags are kept."
+                )
+
+                # Option to force refresh cache
+                force_refresh = st.checkbox("Force refresh (re-extract all tags)", value=False)
+
+                # Check if OpenAI API key is available
+                openai_key = os.getenv("OPENAI_API_KEY")
+                if not openai_key:
+                    st.warning("OpenAI API key not found. Tag extraction will be skipped. "
+                             "Upload a .env file with OPENAI_API_KEY to enable tag extraction.")
+
+                # Process button
+                if st.button("Process Text Dataset"):
+                    with st.spinner("Processing texts..."):
+                        # Progress indicators
+                        progress_text = st.empty()
+                        progress_bar = st.progress(0)
+
+                        def update_progress(current, total):
+                            progress = current / total if total > 0 else 1.0
+                            progress_bar.progress(progress)
+                            progress_text.text(f"Extracting tags: {current}/{total} texts processed")
+
+                        try:
+                            # Extract features and create tabular dataset
+                            df, metadata = text_service.load_text_dataset_as_tabular(
+                                file_path,
+                                dataset_description=dataset_description,
+                                openai_api_key=openai_key,
+                                force_refresh=force_refresh,
+                                batch_size=batch_size,
+                                max_tags=max_tags,
+                                progress_callback=update_progress
+                            )
+
+                            # Save as CSV for compatibility with existing data flow
+                            df.to_csv(INPUT_CSV, index=False)
+
+                            # Store in session state
+                            st.session_state.df = df
+                            st.session_state.text_metadata = metadata
+                            st.session_state.dataset_type = "text"
+
+                            # Store dataset description in session state
+                            st.session_state.dataset_description = text_dataset_description
+
+                            progress_bar.progress(1.0)
+                            progress_text.text("Processing complete!")
+
+                            # Show reduction stats
+                            reduction_stats = metadata.get('reduction_stats', {})
+                            st.success(f"Text dataset converted to tabular format! "
+                                      f"({reduction_stats.get('original_tag_count', 0)} tags extracted → "
+                                      f"{reduction_stats.get('after_merge_count', 0)} after merging → "
+                                      f"{len(metadata['all_tags'])} final tags)")
+
+                        except TextQuotaError as e:
+                            st.error("OpenAI API quota exhausted. Please check your billing settings at https://platform.openai.com/account/billing")
+                        except Exception as e:
+                            st.error(f"Error processing text dataset: {str(e)}")
+
+            except Exception as e:
+                st.error(f"Error loading text dataset: {str(e)}")
 
     # Common section for all data sources - display DataFrame and configure
     if st.session_state.df is not None:
@@ -297,18 +548,93 @@ with tab1:
         st.subheader("Dataset Preview")
         st.write(st.session_state.df.head())
 
+        # Dataset description section - helps make prompts domain-agnostic
+        st.divider()
+        st.subheader("Dataset Description")
+        st.info("Provide context about your dataset. This helps generate more relevant explanations and feature extraction.")
+
+        col_desc1, col_desc2 = st.columns(2)
+        with col_desc1:
+            dataset_domain = st.text_area(
+                "What is this dataset about?",
+                value=st.session_state.dataset_description.get('domain', '') if st.session_state.dataset_description else '',
+                placeholder="e.g., Medical diagnosis data, Manufacturing quality control, SMS spam detection, Customer churn prediction",
+                help="Briefly describe the domain and purpose of this dataset."
+            )
+            row_description = st.text_area(
+                "What does each row represent?",
+                value=st.session_state.dataset_description.get('row_description', '') if st.session_state.dataset_description else '',
+                placeholder="e.g., A patient's medical record, A product from the assembly line, An SMS message, A customer account",
+                help="Describe what a single data point or observation represents."
+            )
+        with col_desc2:
+            prediction_target = st.text_area(
+                "What are you trying to predict?",
+                value=st.session_state.dataset_description.get('prediction_target', '') if st.session_state.dataset_description else '',
+                placeholder="e.g., Whether the patient has diabetes, Whether the product is defective, Whether the message is spam",
+                help="Describe the classification goal."
+            )
+            class_descriptions = st.text_area(
+                "Describe the classes (optional)",
+                value=st.session_state.dataset_description.get('class_descriptions', '') if st.session_state.dataset_description else '',
+                placeholder="e.g., Class 0 = Healthy, Class 1 = Diabetic",
+                help="Provide meaning for each class label."
+            )
+
+        if st.button("Save Dataset Description"):
+            st.session_state.dataset_description = {
+                'domain': dataset_domain,
+                'row_description': row_description,
+                'prediction_target': prediction_target,
+                'class_descriptions': class_descriptions
+            }
+            st.success("Dataset description saved!")
+
         # For image datasets, show metadata
         if st.session_state.dataset_type == "image" and st.session_state.image_metadata:
             meta = st.session_state.image_metadata
             with st.expander("Image Dataset Details"):
                 st.write(f"**Tag features:** {len(meta['all_tags'])}")
                 st.write(f"**Image features:** {len(meta['image_feature_names'])}")
+
+                # Show tag standardization stats if available
+                tag_stats = meta.get('tag_standardization', {})
+                if tag_stats and not tag_stats.get('skipped'):
+                    st.write(f"**Tag standardization:** {tag_stats.get('original_count', 0)} original → "
+                            f"{tag_stats.get('canonical_count', 0)} after semantic merging "
+                            f"({tag_stats.get('merged_groups', 0)} groups merged)")
+
                 st.write(f"**Sample tags:** {', '.join(meta['all_tags'][:10])}...")
+
+        # For text datasets, show metadata
+        if st.session_state.dataset_type == "text" and st.session_state.text_metadata:
+            meta = st.session_state.text_metadata
+            with st.expander("Text Dataset Details"):
+                st.write(f"**Tag features:** {len(meta['all_tags'])}")
+                st.write(f"**Total texts:** {meta['n_texts']}")
+                st.write(f"**Class distribution:** {meta['n_negative']} negative, {meta['n_positive']} positive")
+
+                # Show reduction stats if available
+                reduction_stats = meta.get('reduction_stats', {})
+                if reduction_stats:
+                    st.write(f"**Tag standardization:** {reduction_stats.get('original_tag_count', 0)} original → "
+                            f"{reduction_stats.get('after_merge_count', 0)} after semantic merging → "
+                            f"{reduction_stats.get('final_tag_count', 0)} final (top discriminative)")
+                    st.write(f"**Semantically merged groups:** {reduction_stats.get('merged_groups', 0)}")
+
+                    # Show sample of merged clusters
+                    merged_sample = reduction_stats.get('merged_clusters_sample', {})
+                    if merged_sample:
+                        st.write("**Sample merged tags:**")
+                        for canonical, merged in list(merged_sample.items())[:3]:
+                            st.write(f"  • {canonical} ← {', '.join(merged)}")
+
+                st.write(f"**Selected tags:** {', '.join(meta['all_tags'][:15])}{'...' if len(meta['all_tags']) > 15 else ''}")
 
         columns = st.session_state.df.columns.tolist()
 
         # Filter out non-feature columns for dropping
-        droppable_columns = [c for c in columns if c not in ['image_path']]
+        droppable_columns = [c for c in columns if c not in ['image_path', 'text']]
         columns_to_drop = st.multiselect("Select columns to drop", droppable_columns)
 
         # For image datasets, default target to 'label'
@@ -316,12 +642,21 @@ with tab1:
         st.session_state.target_column = st.selectbox("Select target column", columns, index=default_target_idx)
 
         if st.button("Apply"):
-            # Always drop image_path if it exists (not a feature)
+            # Store original data for display in Explain tab before dropping
+            original_df = pd.read_csv(INPUT_CSV)
+            if 'image_path' in original_df.columns:
+                st.session_state.original_image_paths = original_df['image_path'].tolist()
+            if 'text' in original_df.columns:
+                st.session_state.original_texts = original_df['text'].tolist()
+
+            # Always drop non-feature columns if they exist
             cols_to_drop = columns_to_drop.copy()
             if 'image_path' in columns and 'image_path' not in cols_to_drop:
                 cols_to_drop.append('image_path')
+            if 'text' in columns and 'text' not in cols_to_drop:
+                cols_to_drop.append('text')
 
-            X_train, X_test, y_test, processed_df = data_service.load_data_from_csv(
+            X_train, X_test, y_test, processed_df, test_indices = data_service.load_data_from_csv(
                 INPUT_CSV,
                 st.session_state.target_column,
                 cols_to_drop,
@@ -332,6 +667,7 @@ with tab1:
             st.session_state.X_test = X_test
             st.session_state.y_test = y_test
             st.session_state.processed_df = processed_df
+            st.session_state.test_indices = test_indices
 
             st.success("Train and test sets loaded into session state!")
 
@@ -344,7 +680,14 @@ with tab2:
         if st.session_state.predicates:
             st.write("Simple Predicates:")
             for pred in st.session_state.predicates:
-                st.write(f"{pred['name']}: Column {pred['column_index']}, {pred['comparison']} {pred['threshold']}")
+                if pred.get('is_boolean', False):
+                    # Display boolean predicates more cleanly
+                    col_name = pred.get('column_name', f"Column {pred['column_index']}")
+                    st.write(f"**{pred['name']}**: {col_name} = True")
+                else:
+                    # Display numeric predicates with threshold
+                    col_name = pred.get('column_name', f"Column {pred['column_index']}")
+                    st.write(f"**{pred['name']}**: {col_name} {pred['comparison']} {pred['threshold']}")
 
         if st.session_state.composite_predicates:
             st.write("Composite Predicates:")
@@ -367,31 +710,126 @@ with tab2:
             st.session_state.composite_predicates
         )
     
+    # Helper function to detect if a column is boolean (only 0 and 1 values)
+    def is_boolean_column(df, col_name):
+        """Check if a column contains only boolean values (0 and 1)."""
+        unique_vals = df[col_name].dropna().unique()
+        return set(unique_vals).issubset({0, 1, 0.0, 1.0, True, False})
+
     # Simple Predicate Form
     st.subheader("Create Simple Predicate")
-    with st.form("simple_predicate_form"):
-        pred_name = st.text_input("Predicate Name")
-        if st.session_state.processed_df is not None:
-            columns = st.session_state.processed_df.columns.tolist()
-            column = st.selectbox("Select Column", columns)
-            column_index = columns.index(column) if column in columns else 0
+
+    if st.session_state.processed_df is not None:
+        columns = st.session_state.processed_df.columns.tolist()
+
+        # Use ORIGINAL df (before normalization) to detect boolean columns
+        # processed_df is normalized with StandardScaler, so boolean 0/1 values
+        # become something like -1.0/1.0, breaking the boolean detection
+        original_df = st.session_state.df
+        if original_df is not None:
+            # Check column types using original (unnormalized) data
+            boolean_columns = set(
+                col for col in columns
+                if col in original_df.columns and is_boolean_column(original_df, col)
+            )
         else:
+            # Fallback: assume no boolean columns if original df not available
+            boolean_columns = set()
+        numeric_columns = set(col for col in columns if col not in boolean_columns)
+
+        # Show info about column types
+        if boolean_columns and numeric_columns:
+            st.info(f"**Boolean features:** {len(boolean_columns)} | **Numeric features:** {len(numeric_columns)}")
+
+        # Step 1: Select column first (outside form)
+        selected_column = st.selectbox(
+            "Select Feature Column",
+            columns,
+            key="predicate_column_select",
+            help="Select a column to create a predicate for"
+        )
+
+        # Determine column type
+        is_boolean = selected_column in boolean_columns
+        column_index = columns.index(selected_column) if selected_column in columns else 0
+
+        # Step 2: Show appropriate form based on column type
+        if is_boolean:
+            # Boolean Predicate Form (simplified)
+            st.caption(f"📌 **{selected_column}** is a boolean feature (values: 0 or 1)")
+            with st.form("simple_predicate_form"):
+                # Auto-fill predicate name with column name
+                pred_name = st.text_input(
+                    "Predicate Name",
+                    value=selected_column,
+                    key="bool_pred_name",
+                    help="Name for this predicate (auto-filled with column name)"
+                )
+
+                submit_pred = st.form_submit_button("Add Predicate")
+
+                if submit_pred and pred_name and not(name_exists(pred_name)):
+                    # Under the hood: boolean True = "> 0.5"
+                    st.session_state.predicates.append({
+                        'name': pred_name,
+                        'column_index': column_index,
+                        'threshold': 0.5,
+                        'comparison': 'Greater',
+                        'is_boolean': True,
+                        'column_name': selected_column
+                    })
+                    display_predicates_and_generate_code()
+                elif submit_pred and name_exists(pred_name):
+                    st.warning(f"A predicate named '{pred_name}' already exists.")
+        else:
+            # Numeric Predicate Form (with threshold and comparison)
+            st.caption(f"📊 **{selected_column}** is a numeric feature")
+            with st.form("simple_predicate_form"):
+                # Auto-fill predicate name with column name
+                pred_name = st.text_input(
+                    "Predicate Name",
+                    value=selected_column,
+                    key="num_pred_name",
+                    help="Name for this predicate (auto-filled with column name)"
+                )
+                threshold = st.number_input("Threshold Value", format="%f")
+                comparison = st.selectbox("Comparison Operator", ["Greater", "Less", "Equal"])
+
+                submit_pred = st.form_submit_button("Add Predicate")
+
+                if submit_pred and pred_name and not(name_exists(pred_name)):
+                    st.session_state.predicates.append({
+                        'name': pred_name,
+                        'column_index': column_index,
+                        'threshold': threshold,
+                        'comparison': comparison,
+                        'is_boolean': False,
+                        'column_name': selected_column
+                    })
+                    display_predicates_and_generate_code()
+                elif submit_pred and name_exists(pred_name):
+                    st.warning(f"A predicate named '{pred_name}' already exists.")
+    else:
+        # Fallback when no data is loaded
+        st.warning("Please load and apply a dataset first to create predicates.")
+        with st.form("simple_predicate_form"):
+            pred_name = st.text_input("Predicate Name")
             column_index = st.number_input("Column Index", min_value=0, step=1)
-        threshold = st.number_input("Threshold Value", format="%f")
-        comparison = st.selectbox("Comparison Operator", ["Greater", "Less", "Equal"])
-        submit_simple = st.form_submit_button("Add Predicate")
-        
-        if submit_simple and pred_name and not(name_exists(pred_name)):
-            st.session_state.predicates.append({
-                'name': pred_name,
-                'column_index': column_index,
-                'threshold': threshold,
-                'comparison': comparison
-            })
-            #st.success(f"Predicate {pred_name} added!")
-            display_predicates_and_generate_code()
-        elif name_exists(pred_name):
-            st.warning(f"A predicate or composite predicate named '{pred_name}' already exists. Please choose another name.")
+            threshold = st.number_input("Threshold Value", format="%f")
+            comparison = st.selectbox("Comparison Operator", ["Greater", "Less", "Equal"])
+            submit_simple = st.form_submit_button("Add Predicate")
+
+            if submit_simple and pred_name and not(name_exists(pred_name)):
+                st.session_state.predicates.append({
+                    'name': pred_name,
+                    'column_index': column_index,
+                    'threshold': threshold,
+                    'comparison': comparison,
+                    'is_boolean': False
+                })
+                display_predicates_and_generate_code()
+            elif name_exists(pred_name):
+                st.warning(f"A predicate named '{pred_name}' already exists.")
 
 
     # Composite Predicate Form
@@ -468,12 +906,45 @@ with tab3:
 
 with tab4:
     if st.session_state.X_test is not None:
-        patient_id = st.number_input("Enter Patient Id:", 0, st.session_state.X_test.shape[0] - 1, 0, placeholder="Patient Id")
-        x = st.session_state.X_test[patient_id]
-        y = st.session_state.y_test[patient_id]
+        # Use domain-appropriate terminology based on dataset description
+        sample_label = "Sample"
+        if st.session_state.dataset_description:
+            row_desc = st.session_state.dataset_description.get('row_description', '')
+            if row_desc:
+                # Extract a short label from the row description
+                sample_label = row_desc.split()[0] if row_desc else "Sample"
+                if sample_label.lower() in ['a', 'an', 'the']:
+                    sample_label = row_desc.split()[1] if len(row_desc.split()) > 1 else "Sample"
+
+        sample_id = st.number_input(f"Enter {sample_label} Id:", 0, st.session_state.X_test.shape[0] - 1, 0, placeholder=f"{sample_label} Id")
+        x = st.session_state.X_test[sample_id]
+        y = st.session_state.y_test[sample_id]
+
+        # Display original image or text if available
+        if st.session_state.test_indices is not None:
+            original_idx = st.session_state.test_indices[sample_id]
+
+            # Display original image
+            if st.session_state.dataset_type == "image" and st.session_state.original_image_paths is not None:
+                st.subheader('Original Image:')
+                img_path = st.session_state.original_image_paths[original_idx]
+                # Reconstruct full path using the extracted dataset path
+                if st.session_state.extracted_dataset_path:
+                    full_path = os.path.join(st.session_state.extracted_dataset_path, img_path)
+                    if os.path.exists(full_path):
+                        img = Image.open(full_path)
+                        st.image(img, width=300)
+                    else:
+                        st.warning(f"Image not found: {full_path}")
+
+            # Display original text
+            elif st.session_state.dataset_type == "text" and st.session_state.original_texts is not None:
+                st.subheader('Original Text:')
+                original_text = st.session_state.original_texts[original_idx]
+                st.text_area("", value=original_text, height=150, disabled=True, label_visibility="collapsed")
 
         table_contents = pd.DataFrame(
-            dict(zip(data_service.get_feature_names(), st.session_state.X_test[patient_id])),
+            dict(zip(data_service.get_feature_names(), st.session_state.X_test[sample_id])),
             index=[0]
         ).T.reset_index()
         table_contents.columns = ['Feature', 'Value']
@@ -487,7 +958,8 @@ with tab4:
                 x, y,
                 st.session_state.X_train,
                 st.session_state.target_column,
-                selected_rules
+                selected_rules,
+                dataset_description=st.session_state.dataset_description
             )
 
             # Display predictions

@@ -54,25 +54,52 @@ def calc_rag_embeddings(embeddings, text):
     return embedded
 
 
-def form_query(concepts, important_features, pred_class):
-    merged_concepts = " and ".join(concepts)
-    merged_features = " and ".join(important_features)
-    query = f"""
-        What does it mean if a patient is diagnosed with {pred_class} and also the following characteristics: {merged_concepts}?
-        What role do factors such as {merged_features} play in a diagnosis of {pred_class}?
-    """
+def form_query(concepts, important_features, pred_class, dataset_description=None):
+    merged_concepts = " and ".join(concepts) if concepts else "no specific concepts identified"
+    merged_features = " and ".join(important_features) if important_features else "no specific features"
+
+    # Use dataset description for domain-aware query generation
+    if dataset_description and dataset_description.get('domain'):
+        domain = dataset_description.get('domain', '')
+        row_desc = dataset_description.get('row_description', 'sample')
+        prediction_target = dataset_description.get('prediction_target', '')
+        class_desc = dataset_description.get('class_descriptions', '')
+
+        # Build context-aware query
+        context_info = f"Domain: {domain}. " if domain else ""
+        context_info += f"Each observation represents: {row_desc}. " if row_desc else ""
+        context_info += f"Prediction goal: {prediction_target}. " if prediction_target else ""
+        context_info += f"Class meanings: {class_desc}. " if class_desc else ""
+
+        query = f"""
+        Context: {context_info}
+
+        Given an observation classified as "{pred_class}" with the following characteristics: {merged_concepts}.
+        What does this classification mean and why might these characteristics be relevant?
+        What role do factors such as {merged_features} play in this classification?
+        Provide a brief, domain-appropriate explanation.
+        """
+    else:
+        # Fallback to generic query (not medical-specific)
+        query = f"""
+        Given an observation classified as "{pred_class}" with the following characteristics: {merged_concepts}.
+        What does this classification mean?
+        What role do factors such as {merged_features} play in this classification?
+        Provide a brief explanation.
+        """
+
     print("rag_query: ", query)
     return query
 
 
-def extract_rag_explanation(concepts, important_features, pred_class):
+def extract_rag_explanation(concepts, important_features, pred_class, dataset_description=None):
     # chunks = get_chunks(rag_data_path)
     # if os.path.exists(vectors_path):
     #     rag_vectors = np.load(vectors_path)
     # else:
     #     rag_vectors = calc_rag_embeddings(embeddings_model, chunks)
     #     np.save(vectors_path, rag_vectors)
-    query = form_query(concepts, important_features, pred_class)
+    query = form_query(concepts, important_features, pred_class, dataset_description)
     # query_embed = calc_rag_embeddings(embeddings_model, query)
     #
     # similarities = np.dot(rag_vectors, query_embed.T)
@@ -84,15 +111,30 @@ def extract_rag_explanation(concepts, important_features, pred_class):
     # for (i, p) in enumerate(most_similar):
     #     context += p + "\n\n"
 
-    prompt = f"""
-        Use the following CONTEXT or other trusted medical sources to answer the QUESTION at the end.
-        If the context is not sufficient but you have a valid answer from a well trusted medical source, provide it.
+    # Build domain-aware prompt
+    if dataset_description and dataset_description.get('domain'):
+        domain = dataset_description.get('domain', '')
+        prompt = f"""
+        You are an expert in {domain}.
+        Use the following CONTEXT or other trusted sources relevant to this domain to answer the QUESTION at the end.
+        If the context is not sufficient but you have valid knowledge about this domain, provide it.
         If you don't know the answer, just say that you don't know, don't try to make up an answer.
-        Provide a brief explanation only containing the relevant medical information.
+        Provide a brief, clear explanation that would be helpful for understanding this classification result.
 
         CONTEXT:{context}
         QUESTION:{query}
-    """
+        """
+    else:
+        # Fallback to generic prompt (not medical-specific)
+        prompt = f"""
+        Use the following CONTEXT or your general knowledge to answer the QUESTION at the end.
+        If the context is not sufficient but you have a valid answer, provide it.
+        If you don't know the answer, just say that you don't know, don't try to make up an answer.
+        Provide a brief, clear explanation for this classification result.
+
+        CONTEXT:{context}
+        QUESTION:{query}
+        """
 
     rag_explanation = llm(prompt)
     return rag_explanation
