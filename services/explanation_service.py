@@ -138,7 +138,7 @@ def predict_and_explain(x: np.ndarray, y: int, X_train: np.ndarray,
     """
     from services.model_service import RulesModel, InferenceModel, predict_sample
 
-    # Get trained models
+    # Get trained models (loads whatever .h5 files exist)
     trained_models = [
         RulesModel(),
         InferenceModel("mlp"),
@@ -160,11 +160,12 @@ def predict_and_explain(x: np.ndarray, y: int, X_train: np.ndarray,
     concepts = get_satisfied_concepts(x)
     important_features = top_3_shap_features(collected_shap_values[2])
 
-    # Generate RAG explanation
+    # Generate RAG explanation using LTN model score
+    ltn_score = scores.get("LTN", 0.5)
     rag_explanation = get_rag_explanation(
         concepts,
         important_features,
-        get_predicted_class(scores["LTN"], target_column),
+        get_predicted_class(ltn_score, target_column),
         dataset_description
     )
 

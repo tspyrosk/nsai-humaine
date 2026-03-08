@@ -15,7 +15,7 @@ import io
 from paths import *
 
 # Import business logic services
-from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service
+from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service, notebook_service
 from services.image_service import QuotaExhaustedError as ImageQuotaError
 from services.text_service import QuotaExhaustedError as TextQuotaError
 from PIL import Image
@@ -88,6 +88,8 @@ def init_state():
         st.session_state.original_texts = None
     if 'minio_token' not in st.session_state:
         st.session_state.minio_token = None
+    if 'rules_saved' not in st.session_state:
+        st.session_state.rules_saved = False
     init_predicates_state()
     st.cache_data.clear()
 
@@ -111,6 +113,7 @@ def reset_state():
     st.session_state.original_image_paths = None
     st.session_state.original_texts = None
     st.session_state.rules = []
+    st.session_state.rules_saved = False
     reset_predicates_state()
     st.cache_data.clear()
 
@@ -783,7 +786,7 @@ with tab2:
                     st.warning(f"A predicate named '{pred_name}' already exists.")
         else:
             # Numeric Predicate Form (with threshold and comparison)
-            st.caption(f"📊 **{selected_column}** is a numeric feature")
+            st.caption(f"**{selected_column}** is a numeric feature")
             with st.form("simple_predicate_form"):
                 # Auto-fill predicate name with column name
                 pred_name = st.text_input(
@@ -876,6 +879,11 @@ with tab2:
             st.warning(f"A predicate or composite predicate named '{pred_name}' already exists. Please choose another name.")
 
 with tab3:
+    st.header("Train Models")
+
+    # Step 1: Define and Save Rules First
+    st.subheader("Step 1: Define Rules")
+
     rule_text = st.text_input("Enter rule:", value="")
     if 'rules' not in st.session_state:
         st.session_state.rules = []
@@ -887,25 +895,92 @@ with tab3:
 
     selected_rules = st.pills("Rules Entered:", st.session_state.rules, selection_mode="multi")
 
-    save_rules = st.button("Save")
+    save_rules = st.button("Save Rules")
     if save_rules:
         ltn_code, rules_code = predicate_service.save_and_parse_rules(selected_rules)
+        st.session_state.rules_saved = True
         st.subheader("Generated Code")
         st.code(ltn_code + "\n" + rules_code)
 
-    run = st.button("Train Models")
-    if run:
-        results, models = model_service.run_all_experiments(
-            st.session_state.X_test,
-            st.session_state.y_test,
-            GLOBAL_SEED,
-            TRAIN_EPOCHS
-        )
-        for (res_name, res_value) in results['MLP'].items():
-            create_metric_expander(results, res_name, res_name == 'Accuracy')
+    st.divider()
+
+    # Step 2: Choose Training Method (only show after rules are saved)
+    if st.session_state.get('rules_saved', False):
+        st.subheader("Step 2: Choose Training Method")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("### 🤖 Automated Training")
+            st.write("Train LTN and MLP models directly in Streamlit with the default pipeline.")
+            run = st.button("Train Models", type="primary", use_container_width=True)
+            if run:
+                with st.spinner("Training models..."):
+                    model_service.run_training_pipeline(GLOBAL_SEED, TRAIN_EPOCHS)
+                    st.session_state.models_trained = True
+                    st.rerun()
+
+        with col2:
+            st.markdown("### 📓 Custom Training in JupyterLab")
+            st.write("Open JupyterLab with a pre-configured notebook. Modify hyperparameters, architecture, or training logic as needed.")
+
+            # Session notebook info
+            session_notebook_name = "ltn_training_session.ipynb"
+
+            # Open JupyterLab button
+            jupyter_url = notebook_service.get_jupyter_notebook_url(session_notebook_name)
+            st.link_button("Open JupyterLab", jupyter_url, type="primary", use_container_width=True)
+
+            # Show download button
+            if notebook_service.session_notebook_exists():
+                session_notebook_path = notebook_service.get_session_notebook_path()
+                notebook_content = notebook_service.get_notebook_download_content(session_notebook_path)
+                st.download_button(
+                    label="📥 Download Notebook",
+                    data=notebook_content,
+                    file_name=session_notebook_name,
+                    mime="application/x-ipynb+json",
+                    use_container_width=True
+                )
+            else:
+                st.warning("Session notebook not found in notebooks directory")
+
+        st.divider()
+
+        # Step 3: Unified Model Evaluation
+        st.subheader("Step 3: Model Evaluation")
+
+        available_models = model_service.get_available_models()
+        if available_models:
+            st.caption(f"Available models: {', '.join([m['name'] for m in available_models])}")
+
+            evaluate = st.button("Evaluate Models", type="secondary", use_container_width=False)
+            if evaluate or st.session_state.get('models_trained', False):
+                st.session_state.models_trained = False  # Reset flag
+                with st.spinner("Evaluating models..."):
+                    results = model_service.evaluate_available_models(
+                        st.session_state.X_test,
+                        st.session_state.y_test
+                    )
+                if results:
+                    for res_name in ['Accuracy', 'AUROC', 'F1', 'Precision', 'Recall']:
+                        if any(res_name in r for r in results.values()):
+                            create_metric_expander(results, res_name, res_name == 'Accuracy')
+                    st.success("Models ready! Use the Explain tab to make predictions.")
+                else:
+                    st.warning("No models could be evaluated.")
+        else:
+            st.info("No trained models found. Use one of the training methods above.")
+    else:
+        st.info("👆 Please define and save your rules first to proceed with training.")
 
 with tab4:
     if st.session_state.X_test is not None:
+        # Check for available models
+        available_models = model_service.get_available_models()
+        if available_models:
+            st.caption(f"Available models: {', '.join([m['name'] for m in available_models])}")
+
         # Use domain-appropriate terminology based on dataset description
         sample_label = "Sample"
         if st.session_state.dataset_description:
