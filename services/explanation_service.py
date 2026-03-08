@@ -60,7 +60,7 @@ def top_3_shap_features(shap_values: np.ndarray) -> list:
 
 
 def get_rag_explanation(concepts: list, important_features: list,
-                        predicted_class: str) -> str:
+                        predicted_class: str, dataset_description: dict = None) -> str:
     """
     Generate RAG-based explanation for the prediction.
 
@@ -68,12 +68,13 @@ def get_rag_explanation(concepts: list, important_features: list,
         concepts: List of satisfied concepts/rules
         important_features: List of important feature names
         predicted_class: Predicted class label
+        dataset_description: Optional dict with domain, row_description, prediction_target, class_descriptions
 
     Returns:
         Natural language explanation string
     """
     import models.xai_rag as xai_rag
-    return xai_rag.extract_rag_explanation(concepts, important_features, predicted_class)
+    return xai_rag.extract_rag_explanation(concepts, important_features, predicted_class, dataset_description)
 
 
 def get_satisfied_rules(x: np.ndarray, y: int, selected_rules: list) -> list:
@@ -114,7 +115,8 @@ def get_satisfied_concepts(x: np.ndarray) -> list:
 
 
 def predict_and_explain(x: np.ndarray, y: int, X_train: np.ndarray,
-                        target_column: str, selected_rules: list) -> dict:
+                        target_column: str, selected_rules: list,
+                        dataset_description: dict = None) -> dict:
     """
     Make predictions with all models and generate explanations.
 
@@ -124,6 +126,7 @@ def predict_and_explain(x: np.ndarray, y: int, X_train: np.ndarray,
         X_train: Training data for SHAP background
         target_column: Name of the target column
         selected_rules: List of all available rules
+        dataset_description: Optional dict with domain, row_description, prediction_target, class_descriptions
 
     Returns:
         Dictionary containing:
@@ -161,7 +164,8 @@ def predict_and_explain(x: np.ndarray, y: int, X_train: np.ndarray,
     rag_explanation = get_rag_explanation(
         concepts,
         important_features,
-        get_predicted_class(scores["LTN"], target_column)
+        get_predicted_class(scores["LTN"], target_column),
+        dataset_description
     )
 
     return {

@@ -2,6 +2,10 @@ import requests
 import os
 
 def minio_auth(user, password):
+    # Skip authentication if credentials are not provided
+    if not user or not password:
+        return None
+
     auth_url = "https://humaine-minio-api.euprojects.net/auth/auth"
     credentials = {
         "username": user,
@@ -60,4 +64,4 @@ def minio_upload(token, bucket_name, object_name, file_path):
         else:
             print("Upload failed:", response.status_code, response.text, flush=True)
 
-TOKEN = minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+# Token is now managed via st.session_state in main.py to avoid repeated auth on Streamlit reruns

@@ -70,4 +70,4 @@ np.save(f'{OUTPUT_PATH}/train/idx_{RANDOM_SEED}.npy', train_idx)
 
 np.save(f'{OUTPUT_PATH}/test/X_{RANDOM_SEED}.npy', X_test)
 np.save(f'{OUTPUT_PATH}/test/y_{RANDOM_SEED}.npy', y_test)
-np.save(f'{OUTPUT_PATH}/train/idx_{RANDOM_SEED}.npy', test_idx)
+np.save(f'{OUTPUT_PATH}/test/idx_{RANDOM_SEED}.npy', test_idx)

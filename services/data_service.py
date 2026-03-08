@@ -21,7 +21,7 @@ def load_data_from_csv(csv_path: str, target_column: str, columns_to_drop: list,
         sample_ratio: Ratio of data to use (0.1 to 1.0)
 
     Returns:
-        Tuple of (X_train, X_test, y_test, processed_df)
+        Tuple of (X_train, X_test, y_test, processed_df, test_indices)
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
@@ -33,6 +33,7 @@ def load_data_from_csv(csv_path: str, target_column: str, columns_to_drop: list,
     X_train = np.load(f'{TRAIN_DATA_DIR}/X_{seed}.npy')
     X_test = np.load(f'{TEST_DATA_DIR}/X_{seed}.npy')
     y_test = np.load(f'{TEST_DATA_DIR}/y_{seed}.npy')
+    test_indices = np.load(f'{TEST_DATA_DIR}/idx_{seed}.npy')
 
     # Load feature names and create processed dataframe
     with open(FEATURE_NAMES_PATH, 'r') as file:
@@ -42,7 +43,7 @@ def load_data_from_csv(csv_path: str, target_column: str, columns_to_drop: list,
         columns=new_cols
     )
 
-    return X_train, X_test, y_test, processed_df
+    return X_train, X_test, y_test, processed_df, test_indices
 
 
 def load_data_from_minio(minio_token: str, minio_path: str, target_column: str,
@@ -59,7 +60,7 @@ def load_data_from_minio(minio_token: str, minio_path: str, target_column: str,
         sample_ratio: Ratio of data to use (0.1 to 1.0)
 
     Returns:
-        Tuple of (X_train, X_test, y_test, processed_df)
+        Tuple of (X_train, X_test, y_test, processed_df, test_indices)
 
     Raises:
         Exception: If MinIO download fails

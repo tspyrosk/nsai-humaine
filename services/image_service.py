@@ -27,7 +27,26 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+
+class QuotaExhaustedError(Exception):
+    """Raised when OpenAI API quota is exhausted."""
+    pass
+
+
+def is_quota_error(error) -> bool:
+    """Check if an API error is due to quota exhaustion (not transient rate limit)."""
+    error_str = str(error).lower()
+    quota_indicators = ['quota', 'exceeded', 'billing', 'insufficient_quota', 'budget']
+    return any(indicator in error_str for indicator in quota_indicators)
+
 from paths import INPUT_DIR
+
+# Import tag standardization utilities
+from services.tag_standardization import (
+    standardize_tags_with_frequencies,
+    apply_tag_mapping_to_cache,
+    compute_standardization_stats
+)
 
 
 # =============================================================================
@@ -35,6 +54,8 @@ from paths import INPUT_DIR
 # =============================================================================
 
 TAGS_CACHE_FILENAME = "tags_cache.json"
+# Semantic similarity threshold for tag merging (lower = more aggressive)
+TAG_SIMILARITY_THRESHOLD = 0.4
 IMAGE_FEATURES_CACHE_FILENAME = "image_features_cache.json"
 DATASET_HASH_FILENAME = ".dataset_hash"
 
@@ -181,14 +202,55 @@ def encode_image_to_base64(image_path: Path) -> str:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 
-def extract_tags_from_image(client, image_path: Path, max_retries: int = 5) -> List[str]:
+def extract_tags_from_image(client, image_path: Path, max_retries: int = 5,
+                            dataset_description: dict = None) -> List[str]:
     """
     Use OpenAI Vision API to extract descriptive tags from an image.
+
+    Args:
+        client: OpenAI client instance
+        image_path: Path to the image file
+        max_retries: Maximum retry attempts for API calls
+        dataset_description: Optional dict with domain context for better tag extraction
     """
     if not OPENAI_AVAILABLE:
         return []
 
     base64_image = encode_image_to_base64(image_path)
+
+    # Build context-aware prompt based on dataset description
+    if dataset_description and dataset_description.get('domain'):
+        domain = dataset_description.get('domain', '')
+        row_desc = dataset_description.get('row_description', 'an image')
+        prediction_target = dataset_description.get('prediction_target', '')
+
+        context_intro = f"You are analyzing images from a dataset about: {domain}."
+        if row_desc:
+            context_intro += f" Each image represents: {row_desc}."
+        if prediction_target:
+            context_intro += f" The goal is to: {prediction_target}."
+
+        prompt_text = f"""{context_intro}
+
+Analyze this image and provide a list of visual features and characteristics that could be relevant for classification.
+Focus on features that might help distinguish between different classes in this domain.
+
+Return ONLY a comma-separated list of descriptive tags, like: "feature_one, feature_two, characteristic_three"
+Use lowercase and underscores for multi-word tags."""
+    else:
+        # Fallback to generic prompt (not medical-specific)
+        prompt_text = """Analyze this image and provide a list of visual features and characteristics you observe.
+Focus on features such as:
+- Notable patterns or structures
+- Brightness/darkness patterns
+- Symmetry or asymmetry
+- Texture characteristics (smooth, rough, irregular)
+- Contrast levels
+- Shape characteristics
+- Any notable or distinguishing features
+
+Return ONLY a comma-separated list of descriptive tags, like: "bright_region, asymmetric, irregular_shape, high_contrast"
+Use lowercase and underscores for multi-word tags."""
 
     for attempt in range(max_retries):
         try:
@@ -200,18 +262,7 @@ def extract_tags_from_image(client, image_path: Path, max_retries: int = 5) -> L
                         "content": [
                             {
                                 "type": "text",
-                                "text": """Analyze this image and provide a list of visual features and characteristics you observe.
-Focus on features such as:
-- Presence or absence of abnormal patterns
-- Brightness/darkness patterns
-- Symmetry or asymmetry
-- Texture characteristics (smooth, rough, irregular)
-- Contrast levels
-- Shape characteristics
-- Any visible abnormalities or notable features
-
-Return ONLY a comma-separated list of descriptive tags, like: "bright_region, asymmetric, irregular_shape, high_contrast"
-Use lowercase and underscores for multi-word tags."""
+                                "text": prompt_text
                             },
                             {
                                 "type": "image_url",
@@ -230,12 +281,16 @@ Use lowercase and underscores for multi-word tags."""
             time.sleep(0.5)
             return tags
 
-        except RateLimitError:
+        except RateLimitError as e:
+            if is_quota_error(e):
+                raise QuotaExhaustedError(f"OpenAI quota exhausted: {e}")
             wait_time = (2 ** attempt) + (0.5 * attempt)
             time.sleep(wait_time)
             if attempt == max_retries - 1:
                 return []
-        except APIError:
+        except APIError as e:
+            if is_quota_error(e):
+                raise QuotaExhaustedError(f"OpenAI quota exhausted: {e}")
             wait_time = 2 * (attempt + 1)
             time.sleep(wait_time)
             if attempt == max_retries - 1:
@@ -296,7 +351,8 @@ def filter_tags(tags: List[str]) -> List[str]:
 def extract_and_cache_tags(dataset_path: str, image_paths: List[Path],
                            openai_api_key: Optional[str] = None,
                            force_refresh: bool = False,
-                           progress_callback=None) -> Dict[str, List[str]]:
+                           progress_callback=None,
+                           dataset_description: dict = None) -> Dict[str, List[str]]:
     """
     Extract tags for all images with caching.
 
@@ -306,6 +362,7 @@ def extract_and_cache_tags(dataset_path: str, image_paths: List[Path],
         openai_api_key: OpenAI API key (optional, uses env var if not provided)
         force_refresh: If True, re-extract all tags
         progress_callback: Optional callback for progress updates
+        dataset_description: Optional dict with domain context for better tag extraction
 
     Returns:
         Dict mapping image keys to tag lists
@@ -345,12 +402,16 @@ def extract_and_cache_tags(dataset_path: str, image_paths: List[Path],
             client = OpenAI(api_key=api_key)
 
             for i, (img_path, img_key) in enumerate(images_to_process):
-                tags = extract_tags_from_image(client, img_path)
-                cache[img_key] = tags
+                try:
+                    tags = extract_tags_from_image(client, img_path, dataset_description=dataset_description)
+                    cache[img_key] = tags
 
-                # Save after each image
-                with open(cache_file, 'w') as f:
-                    json.dump(cache, f, indent=2)
+                    # Save after each image
+                    with open(cache_file, 'w') as f:
+                        json.dump(cache, f, indent=2)
+                except QuotaExhaustedError:
+                    # Don't cache failed results, re-raise to notify user
+                    raise
 
                 if progress_callback:
                     progress_callback(i + 1, len(images_to_process))
@@ -533,7 +594,8 @@ def extract_and_cache_image_features(dataset_path: str, image_paths: List[Path],
 def create_tabular_dataset(dataset_path: str, image_paths: List[Path], labels: List[int],
                            tags_cache: Dict[str, List[str]],
                            image_features_cache: Dict[str, Dict[str, float]],
-                           image_feature_names: List[str]) -> Tuple[pd.DataFrame, List[str], List[str]]:
+                           image_feature_names: List[str],
+                           standardize_tags: bool = True) -> Tuple[pd.DataFrame, List[str], List[str], Dict]:
     """
     Convert image dataset to tabular format.
 
@@ -544,13 +606,37 @@ def create_tabular_dataset(dataset_path: str, image_paths: List[Path], labels: L
         tags_cache: Dict mapping image keys to tag lists
         image_features_cache: Dict mapping image keys to feature dicts
         image_feature_names: List of image feature names
+        standardize_tags: If True, apply semantic tag standardization
 
     Returns:
-        Tuple of (DataFrame, all_tags, all_feature_cols)
+        Tuple of (DataFrame, all_tags, all_feature_cols, standardization_stats)
     """
     dataset_dir = Path(dataset_path)
 
-    # Collect all unique tags
+    # Collect all unique tags and their frequencies
+    tag_frequencies = {}
+    for tags in tags_cache.values():
+        for tag in tags:
+            tag_frequencies[tag] = tag_frequencies.get(tag, 0) + 1
+
+    original_tags = list(tag_frequencies.keys())
+    standardization_stats = {}
+
+    # Apply semantic tag standardization if enabled
+    if standardize_tags and len(original_tags) > 1:
+        try:
+            tag_mapping = standardize_tags_with_frequencies(
+                original_tags,
+                tag_frequencies,
+                distance_threshold=TAG_SIMILARITY_THRESHOLD
+            )
+            tags_cache = apply_tag_mapping_to_cache(tags_cache, tag_mapping)
+            standardization_stats = compute_standardization_stats(original_tags, tag_mapping)
+        except ImportError:
+            # sentence-transformers not installed, skip standardization
+            standardization_stats = {'skipped': True, 'reason': 'sentence-transformers not installed'}
+
+    # Collect all unique tags (after standardization)
     all_tags = set()
     for tags in tags_cache.values():
         all_tags.update(tags)
@@ -580,7 +666,7 @@ def create_tabular_dataset(dataset_path: str, image_paths: List[Path], labels: L
     # All feature columns (tags + image features)
     all_feature_cols = list(all_tags) + list(image_feature_names)
 
-    return df, all_tags, all_feature_cols
+    return df, all_tags, all_feature_cols, standardization_stats
 
 
 # =============================================================================
@@ -591,7 +677,8 @@ def load_image_dataset_as_tabular(dataset_path: str,
                                    openai_api_key: Optional[str] = None,
                                    force_refresh: bool = False,
                                    tag_progress_callback=None,
-                                   feature_progress_callback=None) -> Tuple[pd.DataFrame, Dict]:
+                                   feature_progress_callback=None,
+                                   dataset_description: dict = None) -> Tuple[pd.DataFrame, Dict]:
     """
     Load an image dataset and convert it to tabular format.
 
@@ -607,6 +694,7 @@ def load_image_dataset_as_tabular(dataset_path: str,
         force_refresh: If True, ignore cache and re-extract everything
         tag_progress_callback: Callback for tag extraction progress
         feature_progress_callback: Callback for feature extraction progress
+        dataset_description: Optional dict with domain context for better tag extraction
 
     Returns:
         Tuple of (DataFrame, metadata_dict)
@@ -624,7 +712,8 @@ def load_image_dataset_as_tabular(dataset_path: str,
         dataset_path, image_paths,
         openai_api_key=openai_api_key,
         force_refresh=not cache_valid,
-        progress_callback=tag_progress_callback
+        progress_callback=tag_progress_callback,
+        dataset_description=dataset_description
     )
 
     # Extract image features
@@ -634,10 +723,11 @@ def load_image_dataset_as_tabular(dataset_path: str,
         progress_callback=feature_progress_callback
     )
 
-    # Create tabular dataset
-    df, all_tags, all_feature_cols = create_tabular_dataset(
+    # Create tabular dataset (with semantic tag standardization)
+    df, all_tags, all_feature_cols, standardization_stats = create_tabular_dataset(
         dataset_path, image_paths, labels,
-        tags_cache, image_features_cache, image_feature_names
+        tags_cache, image_features_cache, image_feature_names,
+        standardize_tags=True
     )
 
     # Save dataset hash for future cache validation
@@ -651,6 +741,7 @@ def load_image_dataset_as_tabular(dataset_path: str,
         'n_images': len(image_paths),
         'n_positive': sum(labels),
         'n_negative': len(labels) - sum(labels),
+        'tag_standardization': standardization_stats,
     }
 
     return df, metadata
