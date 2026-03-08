@@ -2,6 +2,8 @@
 Model Service - Handles model training, inference, and evaluation.
 """
 import os
+import json
+from typing import List, Dict, Optional
 import numpy as np
 import tensorflow as tf
 from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
@@ -83,6 +85,42 @@ class InferenceModel:
         """
         preds = self.score_samples(X, y)
         return preds > 0.5
+
+
+def get_available_models() -> List[Dict]:
+    """
+    Get list of available trained models.
+
+    Returns:
+        List of dicts with model info (name, path, description)
+    """
+    models = []
+
+    mlp_path = os.path.join(OUTPUT_DIR, "mlp.h5")
+    if os.path.exists(mlp_path):
+        models.append({
+            'name': 'MLP',
+            'path': mlp_path,
+            'description': 'Neural network without rules'
+        })
+
+    ltn_path = os.path.join(OUTPUT_DIR, "ltn.h5")
+    if os.path.exists(ltn_path):
+        models.append({
+            'name': 'LTN',
+            'path': ltn_path,
+            'description': 'Logic Tensor Network with rules'
+        })
+
+    rules_only_path = os.path.join(OUTPUT_DIR, "rules_only.h5")
+    if os.path.exists(rules_only_path):
+        models.append({
+            'name': 'RULES_ONLY',
+            'path': rules_only_path,
+            'description': 'Rules-only model'
+        })
+
+    return models
 
 
 def run_training_pipeline(seed: int, epochs: int) -> None:
@@ -168,3 +206,82 @@ def predict_sample(model, x: np.ndarray, y: int) -> float:
         Prediction score
     """
     return model.score_samples(np.expand_dims(x, axis=0), [y])[0]
+
+
+def evaluate_available_models(X_test: np.ndarray, y_test: np.ndarray) -> Dict:
+    """
+    Evaluate all available trained models on the test set.
+
+    This function evaluates whatever models exist (ltn.h5, mlp.h5, etc.)
+    regardless of how they were trained (automated or notebook).
+
+    Args:
+        X_test: Test features
+        y_test: Test labels
+
+    Returns:
+        Dictionary with results for each model containing metrics
+        (Accuracy, AUROC, F1, Precision, Recall)
+    """
+    results = {}
+
+    # Always include RulesModel
+    try:
+        rules_model = RulesModel()
+        results['RULES'] = _evaluate_model(rules_model, X_test, y_test)
+    except Exception as e:
+        pass  # Rules model may not be available
+
+    # Check and evaluate MLP
+    mlp_path = os.path.join(OUTPUT_DIR, "mlp.h5")
+    if os.path.exists(mlp_path):
+        try:
+            mlp_model = InferenceModel("mlp")
+            results['MLP'] = _evaluate_model(mlp_model, X_test, y_test)
+        except Exception as e:
+            pass
+
+    # Check and evaluate LTN
+    ltn_path = os.path.join(OUTPUT_DIR, "ltn.h5")
+    if os.path.exists(ltn_path):
+        try:
+            ltn_model = InferenceModel("ltn")
+            results['LTN'] = _evaluate_model(ltn_model, X_test, y_test)
+        except Exception as e:
+            pass
+
+    return results
+
+
+def _evaluate_model(model, X_test: np.ndarray, y_test: np.ndarray) -> Dict:
+    """
+    Evaluate a single model and return metrics.
+
+    Args:
+        model: Model instance with predict and score_samples methods
+        X_test: Test features
+        y_test: Test labels
+
+    Returns:
+        Dictionary with Accuracy, AUROC, F1, Precision, Recall
+    """
+    yp = model.predict(X_test, y_test)
+    f1 = f1_score(y_test, yp)
+    acc = balanced_accuracy_score(y_test, yp)
+    auroc = roc_auc_score(
+        y_test,
+        model.score_samples(X_test, y_test),
+        multi_class='ovr',
+        average='weighted'
+    )
+    report = classification_report(y_test, yp, output_dict=True)
+    prec = report[str(1)]['precision']
+    recall = report[str(1)]['recall']
+
+    return {
+        'Accuracy': acc,
+        'AUROC': auroc,
+        'F1': f1,
+        'Precision': prec,
+        'Recall': recall
+    }

@@ -7,7 +7,7 @@ import os
 import numpy as np
 import sys
 from paths import *
-from dataset.minio_utils import TOKEN, minio_upload
+from dataset.minio_utils import minio_upload
 
 #outlines_model = outlines.models.transformers("microsoft/Phi-3.5-mini-instruct")
 outlines_model = outlines.models.openai(

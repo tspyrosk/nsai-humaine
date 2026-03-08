@@ -14,6 +14,10 @@ TRAIN_DATA_DIR = os.path.join(OUTPUT_DIR, "train")
 TEST_DATA_DIR = os.path.join(OUTPUT_DIR, "test")
 LTN_RULES_PATH = os.path.join(OUTPUT_DIR, "ltn_rules.txt")
 
+#NOTEBOOK PATHS
+NOTEBOOKS_DIR = os.path.join(BASE_DIR, "notebooks")
+JUPYTER_URL = os.getenv("JUPYTER_URL", "http://localhost:8889")
+
 #SCRIPT PATHS
 SPLIT_DATASET_SCRIPT = os.path.join(BASE_DIR, "dataset", "split_dataset.py")
 TEXT2RULES_SCRIPT = os.path.join(BASE_DIR, "rules_parsing", "text2rules-v2.py")

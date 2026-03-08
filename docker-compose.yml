@@ -11,7 +11,38 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - MINIO_USER=${MINIO_USER}
       - MINIO_PASS=${MINIO_PASS}
-#    volumes:
-#      - ./input:/app/input
-#      - ./output:/app/output
+      - JUPYTER_URL=http://jupyter:8889
+    volumes:
+      - shared-input:/app/input
+      - shared-output:/app/output
+      - ./notebooks:/app/notebooks
+    depends_on:
+      - jupyter
     restart: unless-stopped
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.jupyter
+    ports:
+      - "8889:8889"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - shared-input:/app/input
+      - shared-output:/app/output
+      - ./notebooks:/app/notebooks
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8889
+      --no-browser
+      --allow-root
+      --notebook-dir=/app/notebooks
+      --ServerApp.token=''
+      --ServerApp.password=''
+    restart: unless-stopped
+
+volumes:
+  shared-input:
+  shared-output:

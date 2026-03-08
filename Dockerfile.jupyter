@@ -9,43 +9,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Copy requirements files
 COPY requirements.txt .
-
 COPY requirements2.txt .
-
 COPY requirements3.txt .
 
+# Install dependencies
 RUN pip install -r requirements.txt --no-cache-dir
 RUN pip install -r requirements2.txt --no-cache-dir
 RUN pip install -r requirements3.txt --no-cache-dir
 
+# Install JupyterLab and nbformat
+RUN pip install jupyterlab nbformat --no-cache-dir
 
-WORKDIR /app
-
-RUN chmod -R a+rX /app
-
+# Copy application code
 COPY . .
 
+# Install the local package
 RUN pip install .
 
-EXPOSE 8888
-
-CMD ["pwd"]
-CMD ["ls"]
-
-RUN pip uninstall -y watchdog
-
-ENV STREAMLIT_WATCH_FILE_CHANGES=false
-ENV STREAMLIT_SERVER_FILEWATCHERTYPE=none
-ENV STREAMLIT_SERVER_HEADLESS=true
-ENV STREAMLIT_GLOBAL_DISABLEWATCHDOGWARNING=true
+# Create directories
+RUN mkdir -p /app/input /app/output /app/notebooks
 
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 
-RUN mkdir -p /app/input
-RUN mkdir -p /app/output
-RUN mkdir -p /app/notebooks
+EXPOSE 8889
 
-
-# For UI
-CMD ["streamlit", "run", "/app/main.py", "--server.port=8888"]
+# Run JupyterLab without authentication
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8889", "--no-browser", "--allow-root", "--notebook-dir=/app/notebooks", "--ServerApp.token=", "--ServerApp.password="]
