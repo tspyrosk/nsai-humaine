@@ -1,4 +1,6 @@
 import os
+import time
+import uuid
 import zipfile
 import tempfile
 import shutil
@@ -15,7 +17,7 @@ import io
 from paths import *
 
 # Import business logic services
-from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service, notebook_service
+from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service, notebook_service, logging_service
 from services.image_service import QuotaExhaustedError as ImageQuotaError
 from services.text_service import QuotaExhaustedError as TextQuotaError
 from PIL import Image
@@ -90,6 +92,12 @@ def init_state():
         st.session_state.minio_token = None
     if 'rules_saved' not in st.session_state:
         st.session_state.rules_saved = False
+    if 'log_events' not in st.session_state:
+        st.session_state.log_events = []
+    if 'session_start_time' not in st.session_state:
+        st.session_state.session_start_time = time.time()
+    if 'run_id' not in st.session_state:
+        st.session_state.run_id = uuid.uuid4().hex[:12]
     init_predicates_state()
     st.cache_data.clear()
 
@@ -120,16 +128,58 @@ def reset_state():
 if st.sidebar.button("Reset Rules"):
     remove_rules()
     st.session_state.rules = []
-    #st.success("Previous rules deleted.")
+    logging_service.append_event(logging_service.make_event(
+        "DomainExpert", "human", "reset all rules",
+        correct=False, event_type="rule_reset"
+    ))
 if st.sidebar.button("Reset Rules and Predicates"):
     remove_rules_and_predicates()
     st.session_state.rules = []
     reset_predicates_state()
-    #st.success("Rules and predicates deleted. Please start again!")
+    logging_service.append_event(logging_service.make_event(
+        "DomainExpert", "human", "reset all rules",
+        correct=False, event_type="rule_reset"
+    ))
+    logging_service.append_event(logging_service.make_event(
+        "DomainExpert", "human", "reset all predicates",
+        correct=False, event_type="predicate_reset"
+    ))
 if st.sidebar.button("Reset All"):
     remove_outputs()
     reset_state()
     st.rerun()
+
+MINIO_BUCKET = "smart-healthcare-diabetes-models"
+LTN_LOCAL_PATH = os.path.join(OUTPUT_DIR, "ltn.h5")
+LTN_PUBLISHED_OBJECT = "published-models/ltn.h5"
+
+@st.dialog("Publish Model")
+def publish_model_dialog():
+    st.write(
+        "The LTN model will be published to MinIO and made available to downstream consumers. "
+        "Do you want to proceed?"
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Yes", use_container_width=True):
+            token = st.session_state.get("minio_token")
+            minio_utils.minio_upload(token, MINIO_BUCKET, LTN_PUBLISHED_OBJECT, LTN_LOCAL_PATH)
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human", "approved model publish to MinIO",
+                correct=True, event_type="decision"
+            ))
+            logging_service.publish_events(token, MINIO_BUCKET, st.session_state.run_id)
+            st.success("Model published successfully.")
+            st.rerun()
+    with col2:
+        if st.button("No", use_container_width=True):
+            st.rerun()
+
+if st.sidebar.button("Publish Model"):
+    if not os.path.exists(LTN_LOCAL_PATH):
+        st.error("No trained LTN model found. Please train the model before publishing.")
+    else:
+        publish_model_dialog()
 
 
 init_state()
@@ -591,6 +641,11 @@ with tab1:
                 'prediction_target': prediction_target,
                 'class_descriptions': class_descriptions
             }
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"saved dataset description: domain={dataset_domain}, target={prediction_target}",
+                event_type="info"
+            ))
             st.success("Dataset description saved!")
 
         # For image datasets, show metadata
@@ -781,6 +836,11 @@ with tab2:
                         'is_boolean': True,
                         'column_name': selected_column
                     })
+                    logging_service.append_event(logging_service.make_event(
+                        "DomainExpert", "human",
+                        f"defined predicate: {pred_name} (feature={selected_column}, boolean=True)",
+                        event_type="predicate_definition"
+                    ))
                     display_predicates_and_generate_code()
                 elif submit_pred and name_exists(pred_name):
                     st.warning(f"A predicate named '{pred_name}' already exists.")
@@ -809,6 +869,11 @@ with tab2:
                         'is_boolean': False,
                         'column_name': selected_column
                     })
+                    logging_service.append_event(logging_service.make_event(
+                        "DomainExpert", "human",
+                        f"defined predicate: {pred_name} (feature={selected_column}, operator={comparison}, threshold={threshold})",
+                        event_type="predicate_definition"
+                    ))
                     display_predicates_and_generate_code()
                 elif submit_pred and name_exists(pred_name):
                     st.warning(f"A predicate named '{pred_name}' already exists.")
@@ -830,6 +895,11 @@ with tab2:
                     'comparison': comparison,
                     'is_boolean': False
                 })
+                logging_service.append_event(logging_service.make_event(
+                    "DomainExpert", "human",
+                    f"defined predicate: {pred_name} (column_index={column_index}, operator={comparison}, threshold={threshold})",
+                    event_type="predicate_definition"
+                ))
                 display_predicates_and_generate_code()
             elif name_exists(pred_name):
                 st.warning(f"A predicate named '{pred_name}' already exists.")
@@ -873,7 +943,12 @@ with tab2:
                 'name': comp_pred_name,
                 'expression': expression
             })
-            #st.success(f"Composite Predicate {comp_pred_name} added!") 
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"defined composite predicate: {comp_pred_name} = {expression}",
+                event_type="predicate_definition"
+            ))
+            #st.success(f"Composite Predicate {comp_pred_name} added!")
             display_predicates_and_generate_code()   
         elif name_exists(comp_pred_name):
             st.warning(f"A predicate or composite predicate named '{pred_name}' already exists. Please choose another name.")
@@ -892,13 +967,27 @@ with tab3:
 
     if add_rule:
         st.session_state.rules.append(rule_text)
+        logging_service.append_event(logging_service.make_event(
+            "DomainExpert", "human",
+            f"authored rule: {rule_text}",
+            event_type="rule_authoring"
+        ))
 
     selected_rules = st.pills("Rules Entered:", st.session_state.rules, selection_mode="multi")
 
     save_rules = st.button("Save Rules")
     if save_rules:
+        _t0 = time.time()
         ltn_code, rules_code = predicate_service.save_and_parse_rules(selected_rules)
+        _rule_parse_latency_ms = round((time.time() - _t0) * 1000, 1)
         st.session_state.rules_saved = True
+        logging_service.append_event(logging_service.make_event(
+            "RuleParser_AI", "ai",
+            f"parsed {len(selected_rules)} natural language rule(s) to LTN formula",
+            latency_ms=_rule_parse_latency_ms,
+            correct=True,
+            event_type="decision"
+        ))
         st.subheader("Generated Code")
         st.code(ltn_code + "\n" + rules_code)
 
@@ -915,6 +1004,10 @@ with tab3:
             st.write("Train LTN and MLP models directly in Streamlit with the default pipeline.")
             run = st.button("Train Models", type="primary", use_container_width=True)
             if run:
+                logging_service.append_event(logging_service.make_event(
+                    "DomainExpert", "human", "triggered model training",
+                    event_type="info"
+                ))
                 with st.spinner("Training models..."):
                     model_service.run_training_pipeline(GLOBAL_SEED, TRAIN_EPOCHS)
                     st.session_state.models_trained = True
@@ -966,6 +1059,26 @@ with tab3:
                     for res_name in ['Accuracy', 'AUROC', 'F1', 'Precision', 'Recall']:
                         if any(res_name in r for r in results.values()):
                             create_metric_expander(results, res_name, res_name == 'Accuracy')
+                    _ltn_f1 = results.get('LTN', {}).get('F1')
+                    _mlp_f1 = results.get('MLP', {}).get('F1')
+                    _rules_f1 = results.get('RULES', {}).get('F1')
+                    _ltn_outperforms = (
+                        _ltn_f1 is not None and
+                        (_mlp_f1 is None or _ltn_f1 > _mlp_f1) and
+                        (_rules_f1 is None or _ltn_f1 > _rules_f1)
+                    )
+                    logging_service.append_event(logging_service.make_event(
+                        "ModelEvaluator_AI", "ai",
+                        f"evaluated model performance: LTN (F1={_ltn_f1}) vs MLP (F1={_mlp_f1}) vs Rules (F1={_rules_f1})",
+                        correct=_ltn_outperforms,
+                        probs={k: v.get('F1') for k, v in results.items() if v.get('F1') is not None},
+                        event_type="ltn_outperforms"
+                    ))
+                    logging_service.publish_events(
+                        st.session_state.get("minio_token"),
+                        MINIO_BUCKET,
+                        st.session_state.run_id
+                    )
                     st.success("Models ready! Use the Explain tab to make predictions.")
                 else:
                     st.warning("No models could be evaluated.")
@@ -1029,6 +1142,11 @@ with tab4:
         st.markdown(f'**True label:** {y.item()}')
         predict = st.button("Predict!")
         if predict:
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"triggered prediction for sample_id={sample_id}",
+                event_type="info"
+            ))
             explanation = explanation_service.predict_and_explain(
                 x, y,
                 st.session_state.X_train,
@@ -1036,6 +1154,32 @@ with tab4:
                 selected_rules,
                 dataset_description=st.session_state.dataset_description
             )
+
+            _scores = explanation['scores']
+            _ltn_score = _scores.get('LTN', 0.5)
+            _predicted_class = explanation_service.get_predicted_class(
+                _ltn_score, st.session_state.target_column
+            )
+            logging_service.append_event(logging_service.make_event(
+                "LTN_Classifier_AI", "ai",
+                f"classifying sample_id={sample_id}",
+                latency_ms=explanation['prediction_latency_ms'],
+                duration_s=round(explanation['prediction_latency_ms'] / 1000, 3),
+                probs={k: round(float(v), 4) for k, v in _scores.items()},
+                event_type="decision"
+            ))
+            logging_service.append_event(logging_service.make_event(
+                "SHAP_Explainer_AI", "ai",
+                f"generated feature importance (top-3: {', '.join(explanation['important_features'])})",
+                event_type="info"
+            ))
+            logging_service.append_event(logging_service.make_event(
+                "XAI_RAG_AI", "ai",
+                f"generated natural language explanation for prediction: {_predicted_class}",
+                latency_ms=explanation['rag_latency_ms'],
+                duration_s=round(explanation['rag_latency_ms'] / 1000, 3),
+                event_type="decision"
+            ))
 
             # Display predictions
             table_contents = pd.DataFrame(explanation['scores'], index=['value']).transpose()
@@ -1055,6 +1199,13 @@ with tab4:
             # Display RAG explanation
             st.subheader('Summary:')
             st.markdown(explanation['rag_explanation'])
+
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"reviewed AI prediction and explanation for sample_id={sample_id}",
+                correct=True,
+                event_type="decision"
+            ))
     else:
         st.warning("Please upload a dataset to get predictions.")
 
