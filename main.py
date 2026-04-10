@@ -4,6 +4,7 @@ import uuid
 import zipfile
 import tempfile
 import shutil
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -151,7 +152,48 @@ if st.sidebar.button("Reset All"):
 
 MINIO_BUCKET = "smart-healthcare-diabetes-models"
 LTN_LOCAL_PATH = os.path.join(OUTPUT_DIR, "ltn.h5")
-LTN_PUBLISHED_OBJECT = "published-models/ltn.h5"
+
+
+def _new_version():
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def check_and_promote(token, version):
+    """Check if an approval file exists for the given version and promote to production if so.
+    Returns True if promotion was performed."""
+    approval = minio_utils.minio_read_json(token, MINIO_BUCKET, f"approvals/{version}/approval.json")
+    if approval is None:
+        return False
+
+    # Copy model from staging to production (download then re-upload)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"ltn_{version}.h5")
+    minio_utils.minio_download(token, MINIO_BUCKET, f"published-models/{version}/ltn.h5", tmp_path)
+    minio_utils.minio_upload(token, MINIO_BUCKET, "production/ltn.h5", tmp_path)
+    os.unlink(tmp_path)
+
+    promoted_at = datetime.now(timezone.utc).isoformat()
+
+    # Write production manifest
+    minio_utils.minio_write_json(token, MINIO_BUCKET, "production/manifest.json", {
+        "version": version,
+        "promoted_at": promoted_at,
+        "source_path": f"published-models/{version}/ltn.h5",
+    })
+
+    # Update version manifest status
+    manifest = minio_utils.minio_read_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json") or {}
+    manifest["status"] = "production"
+    minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", manifest)
+
+    # Update index
+    index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json") or []
+    for entry in index:
+        if entry["version"] == version:
+            entry["status"] = "production"
+    minio_utils.minio_write_json(token, MINIO_BUCKET, "published-models/index.json", index)
+
+    return True
+
 
 @st.dialog("Publish Model")
 def publish_model_dialog():
@@ -163,13 +205,34 @@ def publish_model_dialog():
     with col1:
         if st.button("Yes", use_container_width=True):
             token = st.session_state.get("minio_token")
-            minio_utils.minio_upload(token, MINIO_BUCKET, LTN_PUBLISHED_OBJECT, LTN_LOCAL_PATH)
+            version = _new_version()
+            model_object = f"published-models/{version}/ltn.h5"
+
+            # Upload model to versioned staging path
+            minio_utils.minio_upload(token, MINIO_BUCKET, model_object, LTN_LOCAL_PATH)
+
+            # Write version manifest
+            published_at = datetime.now(timezone.utc).isoformat()
+            minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", {
+                "version": version,
+                "published_at": published_at,
+                "run_id": st.session_state.run_id,
+                "model_path": model_object,
+                "bucket": MINIO_BUCKET,
+                "status": "pending_approval",
+            })
+
+            # Update index
+            index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json") or []
+            index.insert(0, {"version": version, "published_at": published_at, "status": "pending_approval"})
+            minio_utils.minio_write_json(token, MINIO_BUCKET, "published-models/index.json", index)
+
             logging_service.append_event(logging_service.make_event(
                 "DomainExpert", "human", "approved model publish to MinIO",
                 correct=True, event_type="decision"
             ))
             logging_service.publish_events(token, MINIO_BUCKET, st.session_state.run_id)
-            st.success("Model published successfully.")
+            st.success(f"Model published successfully (version: {version}).")
             st.rerun()
     with col2:
         if st.button("No", use_container_width=True):
@@ -226,7 +289,7 @@ def create_metric_expander(results, result_name, start_expanded=False):
                 write_results(results, "LTN", result_name, comp_model_name="MLP")
 
 
-tab1, tab2, tab3, tab4 = st.tabs(["Load", "Predicates", "Train", "Explain"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Load", "Predicates", "Train", "Explain", "Models"])
 
 with tab1:
     st.header("Upload Dataset")
@@ -1208,4 +1271,57 @@ with tab4:
             ))
     else:
         st.warning("Please upload a dataset to get predictions.")
+
+with tab5:
+    st.header("Published Models")
+    token = st.session_state.get("minio_token")
+    if not token:
+        st.warning("MinIO not authenticated. Please upload a .env file.")
+    else:
+        if st.button("Refresh", key="models_refresh"):
+            st.rerun()
+
+        # Current production model banner
+        prod_manifest = minio_utils.minio_read_json(token, MINIO_BUCKET, "production/manifest.json")
+        if prod_manifest:
+            st.success(
+                f"Current production model: version **{prod_manifest['version']}** "
+                f"— promoted {prod_manifest['promoted_at']}"
+            )
+        else:
+            st.info("No model in production yet.")
+
+        st.divider()
+
+        index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json")
+        if not index:
+            st.info("No models published yet.")
+        else:
+            promoted_this_render = False
+            header_col1, header_col2, header_col3 = st.columns([2, 3, 2])
+            header_col1.markdown("**Version**")
+            header_col2.markdown("**Published at**")
+            header_col3.markdown("**Status**")
+            st.divider()
+
+            for entry in index:
+                version = entry["version"]
+                status = entry["status"]
+
+                if status == "pending_approval":
+                    if check_and_promote(token, version):
+                        status = "production"
+                        promoted_this_render = True
+
+                col1, col2, col3 = st.columns([2, 3, 2])
+                col1.write(version)
+                col2.write(entry.get("published_at", "—"))
+                with col3:
+                    if status == "production":
+                        st.success("production")
+                    else:
+                        st.warning("pending approval")
+
+            if promoted_this_render:
+                st.rerun()
 

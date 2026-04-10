@@ -64,4 +64,26 @@ def minio_upload(token, bucket_name, object_name, file_path):
         else:
             print("Upload failed:", response.status_code, response.text, flush=True)
 
+def minio_read_json(token, bucket_name, object_name):
+    """Download a JSON object from MinIO and return it as a dict. Returns None if not found."""
+    data_url = f"https://humaine-minio-api.euprojects.net/main_ops/download/{bucket_name}/{object_name}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "accept": "application/json"
+    }
+    response = requests.get(data_url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    return None
+
+def minio_write_json(token, bucket_name, object_name, data):
+    """Serialize data as JSON and upload it to MinIO."""
+    import json
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+    json.dump(data, tmp)
+    tmp.close()
+    minio_upload(token, bucket_name, object_name, tmp.name)
+    os.unlink(tmp.name)
+
 # Token is now managed via st.session_state in main.py to avoid repeated auth on Streamlit reruns
