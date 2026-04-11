@@ -224,6 +224,7 @@ if USE_RULES:
     with open(file_path, 'a') as f:
         f.write(json.dumps(METADATA) + '\n')
 
-    minio_utils.minio_upload(minio_utils.TOKEN, bucket_name, object_name, file_path)
-    minio_utils.minio_upload(minio_utils.TOKEN, bucket_name, f"test-models/{timestr}_diabetes_ltn.h5", f"{OUTPUT_DIR}/ltn.h5")
-    minio_utils.minio_upload(minio_utils.TOKEN, bucket_name, f"test-models/{timestr}_scaler.pkl", f"{OUTPUT_DIR}/scaler.pkl")
+    token = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+    minio_utils.minio_upload(token, bucket_name, object_name, file_path)
+    minio_utils.minio_upload(token, bucket_name, f"test-models/{timestr}_diabetes_ltn.h5", f"{OUTPUT_DIR}/ltn.h5")
+    minio_utils.minio_upload(token, bucket_name, f"test-models/{timestr}_scaler.pkl", f"{OUTPUT_DIR}/scaler.pkl")

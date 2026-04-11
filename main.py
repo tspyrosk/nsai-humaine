@@ -152,6 +152,7 @@ if st.sidebar.button("Reset All"):
 
 MINIO_BUCKET = "smart-healthcare-diabetes-models"
 LTN_LOCAL_PATH = os.path.join(OUTPUT_DIR, "ltn.h5")
+SCALER_LOCAL_PATH = os.path.join(OUTPUT_DIR, "scaler.pkl")
 
 
 def _new_version():
@@ -165,11 +166,24 @@ def check_and_promote(token, version):
     if approval is None:
         return False
 
-    # Copy model from staging to production (download then re-upload)
-    tmp_path = os.path.join(tempfile.gettempdir(), f"ltn_{version}.h5")
-    minio_utils.minio_download(token, MINIO_BUCKET, f"published-models/{version}/ltn.h5", tmp_path)
-    minio_utils.minio_upload(token, MINIO_BUCKET, "production/ltn.h5", tmp_path)
-    os.unlink(tmp_path)
+    # Copy all versioned artifacts to production (download then re-upload).
+    # feature_names.txt and tag_vocabulary.json are included so the inference
+    # service can reconstruct the exact training feature space from production alone.
+    staging_prefix = f"published-models/{version}"
+    artifacts = [
+        (f"{staging_prefix}/ltn.h5",               "production/ltn.h5"),
+        (f"{staging_prefix}/scaler.pkl",            "production/scaler.pkl"),
+        (f"{staging_prefix}/feature_names.txt",     "production/feature_names.txt"),
+        (f"{staging_prefix}/tag_vocabulary.json",   "production/tag_vocabulary.json"),
+    ]
+    for src, dst in artifacts:
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(dst))
+        try:
+            minio_utils.minio_download(token, MINIO_BUCKET, src, tmp_path)
+            minio_utils.minio_upload(token, MINIO_BUCKET, dst, tmp_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     promoted_at = datetime.now(timezone.utc).isoformat()
 
@@ -177,7 +191,10 @@ def check_and_promote(token, version):
     minio_utils.minio_write_json(token, MINIO_BUCKET, "production/manifest.json", {
         "version": version,
         "promoted_at": promoted_at,
-        "source_path": f"published-models/{version}/ltn.h5",
+        "model_path": f"{staging_prefix}/ltn.h5",
+        "scaler_path": f"{staging_prefix}/scaler.pkl",
+        "feature_names_path": f"{staging_prefix}/feature_names.txt",
+        "tag_vocabulary_path": f"{staging_prefix}/tag_vocabulary.json",
     })
 
     # Update version manifest status
@@ -206,18 +223,28 @@ def publish_model_dialog():
         if st.button("Yes", use_container_width=True):
             token = st.session_state.get("minio_token")
             version = _new_version()
-            model_object = f"published-models/{version}/ltn.h5"
+            staging_prefix    = f"published-models/{version}"
+            model_object      = f"{staging_prefix}/ltn.h5"
+            scaler_object     = f"{staging_prefix}/scaler.pkl"
+            feat_names_object = f"{staging_prefix}/feature_names.txt"
+            tag_vocab_object  = f"{staging_prefix}/tag_vocabulary.json"
 
-            # Upload model to versioned staging path
-            minio_utils.minio_upload(token, MINIO_BUCKET, model_object, LTN_LOCAL_PATH)
+            # Upload all artifacts needed to reconstruct the training feature space.
+            minio_utils.minio_upload(token, MINIO_BUCKET, model_object,      LTN_LOCAL_PATH)
+            minio_utils.minio_upload(token, MINIO_BUCKET, scaler_object,     SCALER_LOCAL_PATH)
+            minio_utils.minio_upload(token, MINIO_BUCKET, feat_names_object, FEATURE_NAMES_PATH)
+            minio_utils.minio_upload(token, MINIO_BUCKET, tag_vocab_object,  TAG_VOCABULARY_PATH)
 
             # Write version manifest
             published_at = datetime.now(timezone.utc).isoformat()
-            minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", {
+            minio_utils.minio_write_json(token, MINIO_BUCKET, f"{staging_prefix}/manifest.json", {
                 "version": version,
                 "published_at": published_at,
                 "run_id": st.session_state.run_id,
                 "model_path": model_object,
+                "scaler_path": scaler_object,
+                "feature_names_path": feat_names_object,
+                "tag_vocabulary_path": tag_vocab_object,
                 "bucket": MINIO_BUCKET,
                 "status": "pending_approval",
             })
@@ -241,6 +268,12 @@ def publish_model_dialog():
 if st.sidebar.button("Publish Model"):
     if not os.path.exists(LTN_LOCAL_PATH):
         st.error("No trained LTN model found. Please train the model before publishing.")
+    elif not os.path.exists(SCALER_LOCAL_PATH):
+        st.error("No scaler found (output/scaler.pkl). Please train the model before publishing.")
+    elif not os.path.exists(FEATURE_NAMES_PATH):
+        st.error("No feature_names.txt found. Please train the model before publishing.")
+    elif not os.path.exists(TAG_VOCABULARY_PATH):
+        st.error("No tag_vocabulary.json found. Please load a dataset before publishing.")
     else:
         publish_model_dialog()
 
@@ -304,6 +337,9 @@ with tab1:
                 INPUT_CSV
             )
             st.session_state.dataset_type = "csv"
+            import json as _json
+            with open(TAG_VOCABULARY_PATH, "w") as _f:
+                _json.dump({"data_type": "tabular", "tags": [], "image_feature_names": []}, _f)
 
     elif upload_method == "MinIO Path":
         minio_path = st.text_input("Enter MinIO Path")
@@ -316,6 +352,9 @@ with tab1:
                     minio_utils.minio_download(st.session_state.minio_token, bucket, path, INPUT_CSV)
                     st.session_state.df = pd.read_csv(INPUT_CSV)
                     st.session_state.dataset_type = "csv"
+                    import json as _json
+                    with open(TAG_VOCABULARY_PATH, "w") as _f:
+                        _json.dump({"data_type": "tabular", "tags": [], "image_feature_names": []}, _f)
                 except Exception as e:
                     st.error(f"Error loading data from MinIO: {str(e)}")
             else:
@@ -460,6 +499,16 @@ with tab1:
 
                             # Save as CSV for compatibility with existing data flow
                             df.to_csv(INPUT_CSV, index=False)
+
+                            # Save tag vocabulary so the inference service can
+                            # constrain its LLM prompts to the training tags.
+                            import json as _json
+                            with open(TAG_VOCABULARY_PATH, "w") as _f:
+                                _json.dump({
+                                    "data_type": "image",
+                                    "tags": list(metadata["all_tags"]),
+                                    "image_feature_names": list(metadata["image_feature_names"]),
+                                }, _f, indent=2)
 
                             # Store in session state
                             st.session_state.df = df
@@ -631,6 +680,16 @@ with tab1:
 
                             # Save as CSV for compatibility with existing data flow
                             df.to_csv(INPUT_CSV, index=False)
+
+                            # Save tag vocabulary so the inference service can
+                            # constrain its LLM prompts to the training tags.
+                            import json as _json
+                            with open(TAG_VOCABULARY_PATH, "w") as _f:
+                                _json.dump({
+                                    "data_type": "text",
+                                    "tags": list(metadata["all_tags"]),
+                                    "image_feature_names": [],
+                                }, _f, indent=2)
 
                             # Store in session state
                             st.session_state.df = df
