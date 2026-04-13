@@ -25,9 +25,6 @@ services:
       - "8890:8888"
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OUTPUT_DIR=/app/output
-    volumes:
-      - shared-output:/app/output:ro
     restart: unless-stopped
 
 volumes:

@@ -18,10 +18,7 @@ RUN pip install -r inference/requirements.txt --no-cache-dir
 # not import from services/ or any Streamlit code.
 COPY inference/ ./inference/
 
-RUN mkdir -p /app/output
-
 ENV PYTHONPATH="/app:${PYTHONPATH}"
-ENV OUTPUT_DIR="/app/output"
 ENV PORT="8888"
 
 # Port 8888 is the standard Kubeflow Notebook server port.

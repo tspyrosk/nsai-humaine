@@ -41,8 +41,9 @@ def explain_predictions(model, x: np.ndarray, X_train: np.ndarray) -> np.ndarray
     def f(x):
         return model.score_samples(x, np.zeros(x.shape[0]))
 
-    explainer = shap.KernelExplainer(f, X_train)
-    shap_values = explainer.shap_values(x)
+    background = shap.sample(X_train, 100) if len(X_train) > 100 else X_train
+    explainer = shap.KernelExplainer(f, background)
+    shap_values = explainer.shap_values(x, nsamples=100)
     return shap_values
 
 

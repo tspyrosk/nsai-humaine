@@ -42,10 +42,14 @@ if env_file:
         env_vars = dotenv_values(stream=io.StringIO(env_text))
         for key, value in env_vars.items():
             os.environ[key] = value
-        st.session_state.minio_token = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+        try:
+            st.session_state.minio_token = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+        except Exception as e:
+            st.session_state.minio_token = None
+            st.sidebar.warning(f"MinIO authentication failed: {e}")
         st.session_state.env_file_id = env_file_id
     st.sidebar.success(".env loaded")
-    if st.session_state.minio_token:
+    if st.session_state.get("minio_token"):
         st.sidebar.success("MinIO authenticated")
 
 def init_predicates_state():
@@ -159,6 +163,24 @@ def _new_version():
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
+# Text and image models are published under a type-specific subdirectory so
+# downstream consumers can distinguish them. Tabular stays at the version root
+# for backwards compatibility.
+_DATA_SUBDIR = {"text": "text", "image": "images"}
+
+
+def _data_subdir(dataset_type):
+    return _DATA_SUBDIR.get(dataset_type)
+
+
+def _staging_prefix(version, data_subdir):
+    return f"published-models/{version}/{data_subdir}" if data_subdir else f"published-models/{version}"
+
+
+def _production_prefix(data_subdir):
+    return f"production/{data_subdir}" if data_subdir else "production"
+
+
 def check_and_promote(token, version):
     """Check if an approval file exists for the given version and promote to production if so.
     Returns True if promotion was performed."""
@@ -166,15 +188,23 @@ def check_and_promote(token, version):
     if approval is None:
         return False
 
+    # Read the version manifest to discover which type-specific subdirectory
+    # this model lives under so we mirror the same layout in production/.
+    version_manifest = minio_utils.minio_read_json(
+        token, MINIO_BUCKET, f"published-models/{version}/manifest.json"
+    ) or {}
+    data_subdir = version_manifest.get("data_subdir")  # "text", "images", or None
+    staging_prefix = _staging_prefix(version, data_subdir)
+    prod_prefix = _production_prefix(data_subdir)
+
     # Copy all versioned artifacts to production (download then re-upload).
     # feature_names.txt and tag_vocabulary.json are included so the inference
     # service can reconstruct the exact training feature space from production alone.
-    staging_prefix = f"published-models/{version}"
     artifacts = [
-        (f"{staging_prefix}/ltn.h5",               "production/ltn.h5"),
-        (f"{staging_prefix}/scaler.pkl",            "production/scaler.pkl"),
-        (f"{staging_prefix}/feature_names.txt",     "production/feature_names.txt"),
-        (f"{staging_prefix}/tag_vocabulary.json",   "production/tag_vocabulary.json"),
+        (f"{staging_prefix}/ltn.h5",               f"{prod_prefix}/ltn.h5"),
+        (f"{staging_prefix}/scaler.pkl",            f"{prod_prefix}/scaler.pkl"),
+        (f"{staging_prefix}/feature_names.txt",     f"{prod_prefix}/feature_names.txt"),
+        (f"{staging_prefix}/tag_vocabulary.json",   f"{prod_prefix}/tag_vocabulary.json"),
     ]
     for src, dst in artifacts:
         tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(dst))
@@ -187,9 +217,12 @@ def check_and_promote(token, version):
 
     promoted_at = datetime.now(timezone.utc).isoformat()
 
-    # Write production manifest
-    minio_utils.minio_write_json(token, MINIO_BUCKET, "production/manifest.json", {
+    # Write production manifest (one per data type so promoting a text model
+    # does not overwrite the pointer to an image model and vice versa).
+    minio_utils.minio_write_json(token, MINIO_BUCKET, f"{prod_prefix}/manifest.json", {
         "version": version,
+        "data_type": version_manifest.get("data_type"),
+        "data_subdir": data_subdir,
         "promoted_at": promoted_at,
         "model_path": f"{staging_prefix}/ltn.h5",
         "scaler_path": f"{staging_prefix}/scaler.pkl",
@@ -198,9 +231,8 @@ def check_and_promote(token, version):
     })
 
     # Update version manifest status
-    manifest = minio_utils.minio_read_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json") or {}
-    manifest["status"] = "production"
-    minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", manifest)
+    version_manifest["status"] = "production"
+    minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", version_manifest)
 
     # Update index
     index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json") or []
@@ -223,7 +255,9 @@ def publish_model_dialog():
         if st.button("Yes", use_container_width=True):
             token = st.session_state.get("minio_token")
             version = _new_version()
-            staging_prefix    = f"published-models/{version}"
+            data_type         = st.session_state.dataset_type
+            data_subdir       = _data_subdir(data_type)
+            staging_prefix    = _staging_prefix(version, data_subdir)
             model_object      = f"{staging_prefix}/ltn.h5"
             scaler_object     = f"{staging_prefix}/scaler.pkl"
             feat_names_object = f"{staging_prefix}/feature_names.txt"
@@ -235,10 +269,14 @@ def publish_model_dialog():
             minio_utils.minio_upload(token, MINIO_BUCKET, feat_names_object, FEATURE_NAMES_PATH)
             minio_utils.minio_upload(token, MINIO_BUCKET, tag_vocab_object,  TAG_VOCABULARY_PATH)
 
-            # Write version manifest
+            # Write version manifest (the version-level manifest lives one
+            # level above the data-type subdir so check_and_promote can find
+            # it without knowing the data type up front).
             published_at = datetime.now(timezone.utc).isoformat()
-            minio_utils.minio_write_json(token, MINIO_BUCKET, f"{staging_prefix}/manifest.json", {
+            minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", {
                 "version": version,
+                "data_type": data_type,
+                "data_subdir": data_subdir,
                 "published_at": published_at,
                 "run_id": st.session_state.run_id,
                 "model_path": model_object,
@@ -251,7 +289,13 @@ def publish_model_dialog():
 
             # Update index
             index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json") or []
-            index.insert(0, {"version": version, "published_at": published_at, "status": "pending_approval"})
+            index.insert(0, {
+                "version": version,
+                "published_at": published_at,
+                "status": "pending_approval",
+                "data_type": data_type,
+                "data_subdir": data_subdir,
+            })
             minio_utils.minio_write_json(token, MINIO_BUCKET, "published-models/index.json", index)
 
             logging_service.append_event(logging_service.make_event(
@@ -372,30 +416,30 @@ with tab1:
             dataset_name = os.path.splitext(uploaded_zip.name)[0]
             dataset_path = os.path.join(INPUT_DIR, f"uploaded_{dataset_name}")
 
-            # Check if we need to extract (avoid re-extracting on every rerun)
+            # Check if we need to extract (avoid re-extracting on every rerun).
+            # Preserve an existing extracted folder across sessions so its cache
+            # files (tags_cache.json, image_features_cache.json, dataset_hash.txt)
+            # survive re-uploads of the same ZIP.
             if 'extracted_dataset_path' not in st.session_state or st.session_state.extracted_dataset_path != dataset_path:
-                # Clean up previous extraction if exists
-                if os.path.exists(dataset_path):
-                    shutil.rmtree(dataset_path)
+                if not os.path.exists(dataset_path):
+                    with st.spinner("Extracting ZIP file..."):
+                        os.makedirs(dataset_path, exist_ok=True)
+                        with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()), 'r') as zip_ref:
+                            zip_ref.extractall(dataset_path)
 
-                # Extract ZIP file
-                with st.spinner("Extracting ZIP file..."):
-                    os.makedirs(dataset_path, exist_ok=True)
-                    with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()), 'r') as zip_ref:
-                        zip_ref.extractall(dataset_path)
-
-                    # Handle case where ZIP contains a single root folder
-                    extracted_items = [f for f in os.listdir(dataset_path) if not f.startswith('.')]
-                    if len(extracted_items) == 1:
-                        single_folder = os.path.join(dataset_path, extracted_items[0])
-                        if os.path.isdir(single_folder):
-                            # Move contents up one level
-                            for item in os.listdir(single_folder):
-                                shutil.move(os.path.join(single_folder, item), dataset_path)
-                            os.rmdir(single_folder)
+                        # Handle case where ZIP contains a single root folder
+                        extracted_items = [f for f in os.listdir(dataset_path) if not f.startswith('.')]
+                        if len(extracted_items) == 1:
+                            single_folder = os.path.join(dataset_path, extracted_items[0])
+                            if os.path.isdir(single_folder):
+                                for item in os.listdir(single_folder):
+                                    shutil.move(os.path.join(single_folder, item), dataset_path)
+                                os.rmdir(single_folder)
+                    st.success(f"ZIP extracted to: {dataset_path}")
+                else:
+                    st.info(f"Reusing existing extracted dataset at: {dataset_path}")
 
                 st.session_state.extracted_dataset_path = dataset_path
-                st.success(f"ZIP extracted to: {dataset_path}")
 
             # Load and display the dataset
             try:

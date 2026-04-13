@@ -41,6 +41,17 @@ else:
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 tf.keras.utils.set_random_seed(RANDOM_SEED)
+# Workaround for tf_keras bug: backend._create_seed calls
+# _SEED_GENERATOR.generator.randint(1, 1e9) with a Python float, which
+# random.Random.randint rejects ("'float' object cannot be interpreted as an integer").
+try:
+    from tf_keras.src import backend as _tfk_backend
+    _gen = getattr(_tfk_backend._SEED_GENERATOR, "generator", None)
+    if _gen is not None:
+        _orig_randint = _gen.randint
+        _gen.randint = lambda a, b, _f=_orig_randint: _f(int(a), int(b))
+except Exception:
+    pass
 tf.config.experimental.enable_op_determinism()
 METADATA = {}
 

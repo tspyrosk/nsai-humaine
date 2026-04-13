@@ -11,6 +11,18 @@ from sklearn.metrics import classification_report
 from paths import *
 
 
+# The training notebook saves .h5 files via Keras 3. Transformers (pulled in
+# through sentence-transformers for tag standardization) forces
+# TF_USE_LEGACY_KERAS=1 on import, which makes `tf.keras` resolve to Keras 2
+# (tf_keras) and reject the Keras-3 `batch_shape` config. Load via the
+# standalone Keras 3 package, which is pinned independently in requirements2.
+try:
+    import keras as _keras3
+    _load_keras_model = _keras3.models.load_model
+except ImportError:
+    _load_keras_model = tf.keras.models.load_model
+
+
 class RulesModel:
     """Model that makes predictions based on rules only."""
 
@@ -56,7 +68,7 @@ class InferenceModel:
         Args:
             model_name: Name of the model (e.g., 'mlp', 'ltn')
         """
-        self.base_model = tf.keras.models.load_model(f'{OUTPUT_DIR}/{model_name}.h5')
+        self.base_model = _load_keras_model(f'{OUTPUT_DIR}/{model_name}.h5')
         self.name = model_name.upper()
 
     def score_samples(self, X, y):
@@ -225,12 +237,15 @@ def evaluate_available_models(X_test: np.ndarray, y_test: np.ndarray) -> Dict:
     """
     results = {}
 
+    import traceback
+
     # Always include RulesModel
     try:
         rules_model = RulesModel()
         results['RULES'] = _evaluate_model(rules_model, X_test, y_test)
     except Exception as e:
-        pass  # Rules model may not be available
+        print(f"[evaluate_available_models] RULES failed: {e}")
+        traceback.print_exc()
 
     # Check and evaluate MLP
     mlp_path = os.path.join(OUTPUT_DIR, "mlp.h5")
@@ -239,7 +254,8 @@ def evaluate_available_models(X_test: np.ndarray, y_test: np.ndarray) -> Dict:
             mlp_model = InferenceModel("mlp")
             results['MLP'] = _evaluate_model(mlp_model, X_test, y_test)
         except Exception as e:
-            pass
+            print(f"[evaluate_available_models] MLP failed: {e}")
+            traceback.print_exc()
 
     # Check and evaluate LTN
     ltn_path = os.path.join(OUTPUT_DIR, "ltn.h5")
@@ -248,7 +264,8 @@ def evaluate_available_models(X_test: np.ndarray, y_test: np.ndarray) -> Dict:
             ltn_model = InferenceModel("ltn")
             results['LTN'] = _evaluate_model(ltn_model, X_test, y_test)
         except Exception as e:
-            pass
+            print(f"[evaluate_available_models] LTN failed: {e}")
+            traceback.print_exc()
 
     return results
 
