@@ -5,47 +5,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     build-essential \
     python3-dev \
+    nginx \
+    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-
 COPY requirements2.txt .
-
 COPY requirements3.txt .
 
-RUN pip install -r requirements.txt --no-cache-dir
-RUN pip install -r requirements2.txt --no-cache-dir
-RUN pip install -r requirements3.txt --no-cache-dir
-
-
-WORKDIR /app
-
-RUN chmod -R a+rX /app
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements2.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements3.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install jupyterlab nbformat ipykernel ipywidgets
+RUN python -m ipykernel install --sys-prefix --name python3 --display-name "Python 3"
+RUN pip uninstall -y watchdog
 
 COPY . .
 
 RUN pip install .
 
-EXPOSE 8888
+RUN mkdir -p /app/input /app/output /app/notebooks
 
-CMD ["pwd"]
-CMD ["ls"]
+COPY nginx.conf /etc/nginx/nginx.conf
+COPY supervisord.conf /etc/supervisor/supervisord.conf
 
-RUN pip uninstall -y watchdog
-
-ENV STREAMLIT_WATCH_FILE_CHANGES=false
-ENV STREAMLIT_SERVER_FILEWATCHERTYPE=none
+ENV PYTHONPATH="/app"
 ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_SERVER_FILEWATCHERTYPE=none
 ENV STREAMLIT_GLOBAL_DISABLEWATCHDOGWARNING=true
 
-ENV PYTHONPATH="/app:${PYTHONPATH}"
+EXPOSE 8888
 
-RUN mkdir -p /app/input
-RUN mkdir -p /app/output
-RUN mkdir -p /app/notebooks
-
-
-# For UI
-CMD ["streamlit", "run", "/app/main.py", "--server.port=8888"]
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]

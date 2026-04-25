@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    build-essential \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY inference/requirements.txt ./inference/requirements.txt
+
+RUN pip install -r inference/requirements.txt --no-cache-dir
+
+# Copy only the inference package and its dependencies.
+# The inference/ package is self-contained — GLCM logic is inlined and does
+# not import from services/ or any Streamlit code.
+COPY inference/ ./inference/
+
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+ENV PORT="8888"
+
+# Port 8888 is the standard Kubeflow Notebook server port.
+# When running via docker-compose, map it to a free host port (e.g. 8890:8888).
+EXPOSE 8888
+
+CMD ["uvicorn", "inference.main:app", "--host", "0.0.0.0", "--port", "8888"]

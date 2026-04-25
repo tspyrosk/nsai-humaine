@@ -41,6 +41,17 @@ else:
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 tf.keras.utils.set_random_seed(RANDOM_SEED)
+# Workaround for tf_keras bug: backend._create_seed calls
+# _SEED_GENERATOR.generator.randint(1, 1e9) with a Python float, which
+# random.Random.randint rejects ("'float' object cannot be interpreted as an integer").
+try:
+    from tf_keras.src import backend as _tfk_backend
+    _gen = getattr(_tfk_backend._SEED_GENERATOR, "generator", None)
+    if _gen is not None:
+        _orig_randint = _gen.randint
+        _gen.randint = lambda a, b, _f=_orig_randint: _f(int(a), int(b))
+except Exception:
+    pass
 tf.config.experimental.enable_op_determinism()
 METADATA = {}
 
@@ -224,6 +235,7 @@ if USE_RULES:
     with open(file_path, 'a') as f:
         f.write(json.dumps(METADATA) + '\n')
 
-    minio_utils.minio_upload(minio_utils.TOKEN, bucket_name, object_name, file_path)
-    minio_utils.minio_upload(minio_utils.TOKEN, bucket_name, f"test-models/{timestr}_diabetes_ltn.h5", f"{OUTPUT_DIR}/ltn.h5")
-    minio_utils.minio_upload(minio_utils.TOKEN, bucket_name, f"test-models/{timestr}_scaler.pkl", f"{OUTPUT_DIR}/scaler.pkl")
+    token = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+    minio_utils.minio_upload(token, bucket_name, object_name, file_path)
+    minio_utils.minio_upload(token, bucket_name, f"test-models/{timestr}_diabetes_ltn.h5", f"{OUTPUT_DIR}/ltn.h5")
+    minio_utils.minio_upload(token, bucket_name, f"test-models/{timestr}_scaler.pkl", f"{OUTPUT_DIR}/scaler.pkl")

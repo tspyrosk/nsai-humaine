@@ -52,8 +52,6 @@ def get_jupyter_notebook_url(notebook_name: str) -> str:
     Returns:
         Full URL to open the notebook in JupyterLab
     """
-    # For external access, use localhost (the browser connects from outside Docker)
-    external_url = JUPYTER_URL.replace("http://jupyter:", "http://localhost:")
-    return f"{external_url}/lab/tree/{notebook_name}"
+    return f"{JUPYTER_URL}/lab/tree/{notebook_name}"
 
 

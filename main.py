@@ -1,7 +1,10 @@
 import os
+import time
+import uuid
 import zipfile
 import tempfile
 import shutil
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -15,7 +18,7 @@ import io
 from paths import *
 
 # Import business logic services
-from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service, notebook_service
+from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service, notebook_service, logging_service
 from services.image_service import QuotaExhaustedError as ImageQuotaError
 from services.text_service import QuotaExhaustedError as TextQuotaError
 from PIL import Image
@@ -39,10 +42,14 @@ if env_file:
         env_vars = dotenv_values(stream=io.StringIO(env_text))
         for key, value in env_vars.items():
             os.environ[key] = value
-        st.session_state.minio_token = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+        try:
+            st.session_state.minio_token = minio_utils.minio_auth(os.getenv("MINIO_USER"), os.getenv("MINIO_PASS"))
+        except Exception as e:
+            st.session_state.minio_token = None
+            st.sidebar.warning(f"MinIO authentication failed: {e}")
         st.session_state.env_file_id = env_file_id
     st.sidebar.success(".env loaded")
-    if st.session_state.minio_token:
+    if st.session_state.get("minio_token"):
         st.sidebar.success("MinIO authenticated")
 
 def init_predicates_state():
@@ -90,6 +97,12 @@ def init_state():
         st.session_state.minio_token = None
     if 'rules_saved' not in st.session_state:
         st.session_state.rules_saved = False
+    if 'log_events' not in st.session_state:
+        st.session_state.log_events = []
+    if 'session_start_time' not in st.session_state:
+        st.session_state.session_start_time = time.time()
+    if 'run_id' not in st.session_state:
+        st.session_state.run_id = uuid.uuid4().hex[:12]
     init_predicates_state()
     st.cache_data.clear()
 
@@ -120,16 +133,193 @@ def reset_state():
 if st.sidebar.button("Reset Rules"):
     remove_rules()
     st.session_state.rules = []
-    #st.success("Previous rules deleted.")
+    logging_service.append_event(logging_service.make_event(
+        "DomainExpert", "human", "reset all rules",
+        correct=False, event_type="rule_reset"
+    ))
 if st.sidebar.button("Reset Rules and Predicates"):
     remove_rules_and_predicates()
     st.session_state.rules = []
     reset_predicates_state()
-    #st.success("Rules and predicates deleted. Please start again!")
+    logging_service.append_event(logging_service.make_event(
+        "DomainExpert", "human", "reset all rules",
+        correct=False, event_type="rule_reset"
+    ))
+    logging_service.append_event(logging_service.make_event(
+        "DomainExpert", "human", "reset all predicates",
+        correct=False, event_type="predicate_reset"
+    ))
 if st.sidebar.button("Reset All"):
     remove_outputs()
     reset_state()
     st.rerun()
+
+MINIO_BUCKET = "smart-healthcare-diabetes-models"
+LTN_LOCAL_PATH = os.path.join(OUTPUT_DIR, "ltn.h5")
+SCALER_LOCAL_PATH = os.path.join(OUTPUT_DIR, "scaler.pkl")
+
+
+def _new_version():
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+# Text and image models are published under a type-specific subdirectory so
+# downstream consumers can distinguish them. Tabular stays at the version root
+# for backwards compatibility.
+_DATA_SUBDIR = {"text": "text", "image": "images"}
+
+
+def _data_subdir(dataset_type):
+    return _DATA_SUBDIR.get(dataset_type)
+
+
+def _staging_prefix(version, data_subdir):
+    return f"published-models/{version}/{data_subdir}" if data_subdir else f"published-models/{version}"
+
+
+def _production_prefix(data_subdir):
+    return f"production/{data_subdir}" if data_subdir else "production"
+
+
+def check_and_promote(token, version):
+    """Check if an approval file exists for the given version and promote to production if so.
+    Returns True if promotion was performed."""
+    approval = minio_utils.minio_read_json(token, MINIO_BUCKET, f"approvals/{version}/approval.json")
+    if approval is None:
+        return False
+
+    # Read the version manifest to discover which type-specific subdirectory
+    # this model lives under so we mirror the same layout in production/.
+    version_manifest = minio_utils.minio_read_json(
+        token, MINIO_BUCKET, f"published-models/{version}/manifest.json"
+    ) or {}
+    data_subdir = version_manifest.get("data_subdir")  # "text", "images", or None
+    staging_prefix = _staging_prefix(version, data_subdir)
+    prod_prefix = _production_prefix(data_subdir)
+
+    # Copy all versioned artifacts to production (download then re-upload).
+    # feature_names.txt and tag_vocabulary.json are included so the inference
+    # service can reconstruct the exact training feature space from production alone.
+    artifacts = [
+        (f"{staging_prefix}/ltn.h5",               f"{prod_prefix}/ltn.h5"),
+        (f"{staging_prefix}/scaler.pkl",            f"{prod_prefix}/scaler.pkl"),
+        (f"{staging_prefix}/feature_names.txt",     f"{prod_prefix}/feature_names.txt"),
+        (f"{staging_prefix}/tag_vocabulary.json",   f"{prod_prefix}/tag_vocabulary.json"),
+    ]
+    for src, dst in artifacts:
+        tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(dst))
+        try:
+            minio_utils.minio_download(token, MINIO_BUCKET, src, tmp_path)
+            minio_utils.minio_upload(token, MINIO_BUCKET, dst, tmp_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    promoted_at = datetime.now(timezone.utc).isoformat()
+
+    # Write production manifest (one per data type so promoting a text model
+    # does not overwrite the pointer to an image model and vice versa).
+    minio_utils.minio_write_json(token, MINIO_BUCKET, f"{prod_prefix}/manifest.json", {
+        "version": version,
+        "data_type": version_manifest.get("data_type"),
+        "data_subdir": data_subdir,
+        "promoted_at": promoted_at,
+        "model_path": f"{staging_prefix}/ltn.h5",
+        "scaler_path": f"{staging_prefix}/scaler.pkl",
+        "feature_names_path": f"{staging_prefix}/feature_names.txt",
+        "tag_vocabulary_path": f"{staging_prefix}/tag_vocabulary.json",
+    })
+
+    # Update version manifest status
+    version_manifest["status"] = "production"
+    minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", version_manifest)
+
+    # Update index
+    index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json") or []
+    for entry in index:
+        if entry["version"] == version:
+            entry["status"] = "production"
+    minio_utils.minio_write_json(token, MINIO_BUCKET, "published-models/index.json", index)
+
+    return True
+
+
+@st.dialog("Publish Model")
+def publish_model_dialog():
+    st.write(
+        "The LTN model will be published to MinIO and made available to downstream consumers. "
+        "Do you want to proceed?"
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Yes", use_container_width=True):
+            token = st.session_state.get("minio_token")
+            version = _new_version()
+            data_type         = st.session_state.dataset_type
+            data_subdir       = _data_subdir(data_type)
+            staging_prefix    = _staging_prefix(version, data_subdir)
+            model_object      = f"{staging_prefix}/ltn.h5"
+            scaler_object     = f"{staging_prefix}/scaler.pkl"
+            feat_names_object = f"{staging_prefix}/feature_names.txt"
+            tag_vocab_object  = f"{staging_prefix}/tag_vocabulary.json"
+
+            # Upload all artifacts needed to reconstruct the training feature space.
+            minio_utils.minio_upload(token, MINIO_BUCKET, model_object,      LTN_LOCAL_PATH)
+            minio_utils.minio_upload(token, MINIO_BUCKET, scaler_object,     SCALER_LOCAL_PATH)
+            minio_utils.minio_upload(token, MINIO_BUCKET, feat_names_object, FEATURE_NAMES_PATH)
+            minio_utils.minio_upload(token, MINIO_BUCKET, tag_vocab_object,  TAG_VOCABULARY_PATH)
+
+            # Write version manifest (the version-level manifest lives one
+            # level above the data-type subdir so check_and_promote can find
+            # it without knowing the data type up front).
+            published_at = datetime.now(timezone.utc).isoformat()
+            minio_utils.minio_write_json(token, MINIO_BUCKET, f"published-models/{version}/manifest.json", {
+                "version": version,
+                "data_type": data_type,
+                "data_subdir": data_subdir,
+                "published_at": published_at,
+                "run_id": st.session_state.run_id,
+                "model_path": model_object,
+                "scaler_path": scaler_object,
+                "feature_names_path": feat_names_object,
+                "tag_vocabulary_path": tag_vocab_object,
+                "bucket": MINIO_BUCKET,
+                "status": "pending_approval",
+            })
+
+            # Update index
+            index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json") or []
+            index.insert(0, {
+                "version": version,
+                "published_at": published_at,
+                "status": "pending_approval",
+                "data_type": data_type,
+                "data_subdir": data_subdir,
+            })
+            minio_utils.minio_write_json(token, MINIO_BUCKET, "published-models/index.json", index)
+
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human", "approved model publish to MinIO",
+                correct=True, event_type="decision"
+            ))
+            logging_service.publish_events(token, MINIO_BUCKET, st.session_state.run_id)
+            st.success(f"Model published successfully (version: {version}).")
+            st.rerun()
+    with col2:
+        if st.button("No", use_container_width=True):
+            st.rerun()
+
+if st.sidebar.button("Publish Model"):
+    if not os.path.exists(LTN_LOCAL_PATH):
+        st.error("No trained LTN model found. Please train the model before publishing.")
+    elif not os.path.exists(SCALER_LOCAL_PATH):
+        st.error("No scaler found (output/scaler.pkl). Please train the model before publishing.")
+    elif not os.path.exists(FEATURE_NAMES_PATH):
+        st.error("No feature_names.txt found. Please train the model before publishing.")
+    elif not os.path.exists(TAG_VOCABULARY_PATH):
+        st.error("No tag_vocabulary.json found. Please load a dataset before publishing.")
+    else:
+        publish_model_dialog()
 
 
 init_state()
@@ -176,7 +366,7 @@ def create_metric_expander(results, result_name, start_expanded=False):
                 write_results(results, "LTN", result_name, comp_model_name="MLP")
 
 
-tab1, tab2, tab3, tab4 = st.tabs(["Load", "Predicates", "Train", "Explain"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Load", "Predicates", "Train", "Explain", "Models"])
 
 with tab1:
     st.header("Upload Dataset")
@@ -191,6 +381,9 @@ with tab1:
                 INPUT_CSV
             )
             st.session_state.dataset_type = "csv"
+            import json as _json
+            with open(TAG_VOCABULARY_PATH, "w") as _f:
+                _json.dump({"data_type": "tabular", "tags": [], "image_feature_names": []}, _f)
 
     elif upload_method == "MinIO Path":
         minio_path = st.text_input("Enter MinIO Path")
@@ -203,6 +396,9 @@ with tab1:
                     minio_utils.minio_download(st.session_state.minio_token, bucket, path, INPUT_CSV)
                     st.session_state.df = pd.read_csv(INPUT_CSV)
                     st.session_state.dataset_type = "csv"
+                    import json as _json
+                    with open(TAG_VOCABULARY_PATH, "w") as _f:
+                        _json.dump({"data_type": "tabular", "tags": [], "image_feature_names": []}, _f)
                 except Exception as e:
                     st.error(f"Error loading data from MinIO: {str(e)}")
             else:
@@ -220,30 +416,30 @@ with tab1:
             dataset_name = os.path.splitext(uploaded_zip.name)[0]
             dataset_path = os.path.join(INPUT_DIR, f"uploaded_{dataset_name}")
 
-            # Check if we need to extract (avoid re-extracting on every rerun)
+            # Check if we need to extract (avoid re-extracting on every rerun).
+            # Preserve an existing extracted folder across sessions so its cache
+            # files (tags_cache.json, image_features_cache.json, dataset_hash.txt)
+            # survive re-uploads of the same ZIP.
             if 'extracted_dataset_path' not in st.session_state or st.session_state.extracted_dataset_path != dataset_path:
-                # Clean up previous extraction if exists
-                if os.path.exists(dataset_path):
-                    shutil.rmtree(dataset_path)
+                if not os.path.exists(dataset_path):
+                    with st.spinner("Extracting ZIP file..."):
+                        os.makedirs(dataset_path, exist_ok=True)
+                        with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()), 'r') as zip_ref:
+                            zip_ref.extractall(dataset_path)
 
-                # Extract ZIP file
-                with st.spinner("Extracting ZIP file..."):
-                    os.makedirs(dataset_path, exist_ok=True)
-                    with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()), 'r') as zip_ref:
-                        zip_ref.extractall(dataset_path)
-
-                    # Handle case where ZIP contains a single root folder
-                    extracted_items = [f for f in os.listdir(dataset_path) if not f.startswith('.')]
-                    if len(extracted_items) == 1:
-                        single_folder = os.path.join(dataset_path, extracted_items[0])
-                        if os.path.isdir(single_folder):
-                            # Move contents up one level
-                            for item in os.listdir(single_folder):
-                                shutil.move(os.path.join(single_folder, item), dataset_path)
-                            os.rmdir(single_folder)
+                        # Handle case where ZIP contains a single root folder
+                        extracted_items = [f for f in os.listdir(dataset_path) if not f.startswith('.')]
+                        if len(extracted_items) == 1:
+                            single_folder = os.path.join(dataset_path, extracted_items[0])
+                            if os.path.isdir(single_folder):
+                                for item in os.listdir(single_folder):
+                                    shutil.move(os.path.join(single_folder, item), dataset_path)
+                                os.rmdir(single_folder)
+                    st.success(f"ZIP extracted to: {dataset_path}")
+                else:
+                    st.info(f"Reusing existing extracted dataset at: {dataset_path}")
 
                 st.session_state.extracted_dataset_path = dataset_path
-                st.success(f"ZIP extracted to: {dataset_path}")
 
             # Load and display the dataset
             try:
@@ -347,6 +543,16 @@ with tab1:
 
                             # Save as CSV for compatibility with existing data flow
                             df.to_csv(INPUT_CSV, index=False)
+
+                            # Save tag vocabulary so the inference service can
+                            # constrain its LLM prompts to the training tags.
+                            import json as _json
+                            with open(TAG_VOCABULARY_PATH, "w") as _f:
+                                _json.dump({
+                                    "data_type": "image",
+                                    "tags": list(metadata["all_tags"]),
+                                    "image_feature_names": list(metadata["image_feature_names"]),
+                                }, _f, indent=2)
 
                             # Store in session state
                             st.session_state.df = df
@@ -519,6 +725,16 @@ with tab1:
                             # Save as CSV for compatibility with existing data flow
                             df.to_csv(INPUT_CSV, index=False)
 
+                            # Save tag vocabulary so the inference service can
+                            # constrain its LLM prompts to the training tags.
+                            import json as _json
+                            with open(TAG_VOCABULARY_PATH, "w") as _f:
+                                _json.dump({
+                                    "data_type": "text",
+                                    "tags": list(metadata["all_tags"]),
+                                    "image_feature_names": [],
+                                }, _f, indent=2)
+
                             # Store in session state
                             st.session_state.df = df
                             st.session_state.text_metadata = metadata
@@ -591,6 +807,11 @@ with tab1:
                 'prediction_target': prediction_target,
                 'class_descriptions': class_descriptions
             }
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"saved dataset description: domain={dataset_domain}, target={prediction_target}",
+                event_type="info"
+            ))
             st.success("Dataset description saved!")
 
         # For image datasets, show metadata
@@ -781,6 +1002,11 @@ with tab2:
                         'is_boolean': True,
                         'column_name': selected_column
                     })
+                    logging_service.append_event(logging_service.make_event(
+                        "DomainExpert", "human",
+                        f"defined predicate: {pred_name} (feature={selected_column}, boolean=True)",
+                        event_type="predicate_definition"
+                    ))
                     display_predicates_and_generate_code()
                 elif submit_pred and name_exists(pred_name):
                     st.warning(f"A predicate named '{pred_name}' already exists.")
@@ -809,6 +1035,11 @@ with tab2:
                         'is_boolean': False,
                         'column_name': selected_column
                     })
+                    logging_service.append_event(logging_service.make_event(
+                        "DomainExpert", "human",
+                        f"defined predicate: {pred_name} (feature={selected_column}, operator={comparison}, threshold={threshold})",
+                        event_type="predicate_definition"
+                    ))
                     display_predicates_and_generate_code()
                 elif submit_pred and name_exists(pred_name):
                     st.warning(f"A predicate named '{pred_name}' already exists.")
@@ -830,6 +1061,11 @@ with tab2:
                     'comparison': comparison,
                     'is_boolean': False
                 })
+                logging_service.append_event(logging_service.make_event(
+                    "DomainExpert", "human",
+                    f"defined predicate: {pred_name} (column_index={column_index}, operator={comparison}, threshold={threshold})",
+                    event_type="predicate_definition"
+                ))
                 display_predicates_and_generate_code()
             elif name_exists(pred_name):
                 st.warning(f"A predicate named '{pred_name}' already exists.")
@@ -873,7 +1109,12 @@ with tab2:
                 'name': comp_pred_name,
                 'expression': expression
             })
-            #st.success(f"Composite Predicate {comp_pred_name} added!") 
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"defined composite predicate: {comp_pred_name} = {expression}",
+                event_type="predicate_definition"
+            ))
+            #st.success(f"Composite Predicate {comp_pred_name} added!")
             display_predicates_and_generate_code()   
         elif name_exists(comp_pred_name):
             st.warning(f"A predicate or composite predicate named '{pred_name}' already exists. Please choose another name.")
@@ -892,13 +1133,27 @@ with tab3:
 
     if add_rule:
         st.session_state.rules.append(rule_text)
+        logging_service.append_event(logging_service.make_event(
+            "DomainExpert", "human",
+            f"authored rule: {rule_text}",
+            event_type="rule_authoring"
+        ))
 
     selected_rules = st.pills("Rules Entered:", st.session_state.rules, selection_mode="multi")
 
     save_rules = st.button("Save Rules")
     if save_rules:
+        _t0 = time.time()
         ltn_code, rules_code = predicate_service.save_and_parse_rules(selected_rules)
+        _rule_parse_latency_ms = round((time.time() - _t0) * 1000, 1)
         st.session_state.rules_saved = True
+        logging_service.append_event(logging_service.make_event(
+            "RuleParser_AI", "ai",
+            f"parsed {len(selected_rules)} natural language rule(s) to LTN formula",
+            latency_ms=_rule_parse_latency_ms,
+            correct=True,
+            event_type="decision"
+        ))
         st.subheader("Generated Code")
         st.code(ltn_code + "\n" + rules_code)
 
@@ -915,6 +1170,10 @@ with tab3:
             st.write("Train LTN and MLP models directly in Streamlit with the default pipeline.")
             run = st.button("Train Models", type="primary", use_container_width=True)
             if run:
+                logging_service.append_event(logging_service.make_event(
+                    "DomainExpert", "human", "triggered model training",
+                    event_type="info"
+                ))
                 with st.spinner("Training models..."):
                     model_service.run_training_pipeline(GLOBAL_SEED, TRAIN_EPOCHS)
                     st.session_state.models_trained = True
@@ -966,6 +1225,26 @@ with tab3:
                     for res_name in ['Accuracy', 'AUROC', 'F1', 'Precision', 'Recall']:
                         if any(res_name in r for r in results.values()):
                             create_metric_expander(results, res_name, res_name == 'Accuracy')
+                    _ltn_f1 = results.get('LTN', {}).get('F1')
+                    _mlp_f1 = results.get('MLP', {}).get('F1')
+                    _rules_f1 = results.get('RULES', {}).get('F1')
+                    _ltn_outperforms = (
+                        _ltn_f1 is not None and
+                        (_mlp_f1 is None or _ltn_f1 > _mlp_f1) and
+                        (_rules_f1 is None or _ltn_f1 > _rules_f1)
+                    )
+                    logging_service.append_event(logging_service.make_event(
+                        "ModelEvaluator_AI", "ai",
+                        f"evaluated model performance: LTN (F1={_ltn_f1}) vs MLP (F1={_mlp_f1}) vs Rules (F1={_rules_f1})",
+                        correct=_ltn_outperforms,
+                        probs={k: v.get('F1') for k, v in results.items() if v.get('F1') is not None},
+                        event_type="ltn_outperforms"
+                    ))
+                    logging_service.publish_events(
+                        st.session_state.get("minio_token"),
+                        MINIO_BUCKET,
+                        st.session_state.run_id
+                    )
                     st.success("Models ready! Use the Explain tab to make predictions.")
                 else:
                     st.warning("No models could be evaluated.")
@@ -1029,6 +1308,11 @@ with tab4:
         st.markdown(f'**True label:** {y.item()}')
         predict = st.button("Predict!")
         if predict:
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"triggered prediction for sample_id={sample_id}",
+                event_type="info"
+            ))
             explanation = explanation_service.predict_and_explain(
                 x, y,
                 st.session_state.X_train,
@@ -1036,6 +1320,32 @@ with tab4:
                 selected_rules,
                 dataset_description=st.session_state.dataset_description
             )
+
+            _scores = explanation['scores']
+            _ltn_score = _scores.get('LTN', 0.5)
+            _predicted_class = explanation_service.get_predicted_class(
+                _ltn_score, st.session_state.target_column
+            )
+            logging_service.append_event(logging_service.make_event(
+                "LTN_Classifier_AI", "ai",
+                f"classifying sample_id={sample_id}",
+                latency_ms=explanation['prediction_latency_ms'],
+                duration_s=round(explanation['prediction_latency_ms'] / 1000, 3),
+                probs={k: round(float(v), 4) for k, v in _scores.items()},
+                event_type="decision"
+            ))
+            logging_service.append_event(logging_service.make_event(
+                "SHAP_Explainer_AI", "ai",
+                f"generated feature importance (top-3: {', '.join(explanation['important_features'])})",
+                event_type="info"
+            ))
+            logging_service.append_event(logging_service.make_event(
+                "XAI_RAG_AI", "ai",
+                f"generated natural language explanation for prediction: {_predicted_class}",
+                latency_ms=explanation['rag_latency_ms'],
+                duration_s=round(explanation['rag_latency_ms'] / 1000, 3),
+                event_type="decision"
+            ))
 
             # Display predictions
             table_contents = pd.DataFrame(explanation['scores'], index=['value']).transpose()
@@ -1055,6 +1365,66 @@ with tab4:
             # Display RAG explanation
             st.subheader('Summary:')
             st.markdown(explanation['rag_explanation'])
+
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"reviewed AI prediction and explanation for sample_id={sample_id}",
+                correct=True,
+                event_type="decision"
+            ))
     else:
         st.warning("Please upload a dataset to get predictions.")
+
+with tab5:
+    st.header("Published Models")
+    token = st.session_state.get("minio_token")
+    if not token:
+        st.warning("MinIO not authenticated. Please upload a .env file.")
+    else:
+        if st.button("Refresh", key="models_refresh"):
+            st.rerun()
+
+        # Current production model banner
+        prod_manifest = minio_utils.minio_read_json(token, MINIO_BUCKET, "production/manifest.json")
+        if prod_manifest:
+            st.success(
+                f"Current production model: version **{prod_manifest['version']}** "
+                f"— promoted {prod_manifest['promoted_at']}"
+            )
+        else:
+            st.info("No model in production yet.")
+
+        st.divider()
+
+        index = minio_utils.minio_read_json(token, MINIO_BUCKET, "published-models/index.json")
+        if not index:
+            st.info("No models published yet.")
+        else:
+            promoted_this_render = False
+            header_col1, header_col2, header_col3 = st.columns([2, 3, 2])
+            header_col1.markdown("**Version**")
+            header_col2.markdown("**Published at**")
+            header_col3.markdown("**Status**")
+            st.divider()
+
+            for entry in index:
+                version = entry["version"]
+                status = entry["status"]
+
+                if status == "pending_approval":
+                    if check_and_promote(token, version):
+                        status = "production"
+                        promoted_this_render = True
+
+                col1, col2, col3 = st.columns([2, 3, 2])
+                col1.write(version)
+                col2.write(entry.get("published_at", "—"))
+                with col3:
+                    if status == "production":
+                        st.success("production")
+                    else:
+                        st.warning("pending approval")
+
+            if promoted_this_render:
+                st.rerun()
 

@@ -1,6 +1,8 @@
 """
 Explanation Service - Handles SHAP explanations and XAI operations.
 """
+import time
+
 import numpy as np
 import shap
 from services.data_service import get_feature_names
@@ -39,8 +41,9 @@ def explain_predictions(model, x: np.ndarray, X_train: np.ndarray) -> np.ndarray
     def f(x):
         return model.score_samples(x, np.zeros(x.shape[0]))
 
-    explainer = shap.KernelExplainer(f, X_train)
-    shap_values = explainer.shap_values(x)
+    background = shap.sample(X_train, 100) if len(X_train) > 100 else X_train
+    explainer = shap.KernelExplainer(f, background)
+    shap_values = explainer.shap_values(x, nsamples=100)
     return shap_values
 
 
@@ -145,15 +148,17 @@ def predict_and_explain(x: np.ndarray, y: int, X_train: np.ndarray,
         InferenceModel("ltn")
     ]
 
-    # Collect predictions
+    # Collect predictions and SHAP values
     scores = {}
     collected_shap_values = []
 
+    t0 = time.time()
     for trained_model in trained_models:
         pred = predict_sample(trained_model, x, y)
         scores[trained_model.name] = pred
         shap_values = explain_predictions(trained_model, np.expand_dims(x, axis=0), X_train)
         collected_shap_values.append(shap_values[0])
+    prediction_latency_ms = round((time.time() - t0) * 1000, 1)
 
     # Get rule and concept explanations
     satisfied_rules = get_satisfied_rules(x, y, selected_rules)
@@ -162,17 +167,21 @@ def predict_and_explain(x: np.ndarray, y: int, X_train: np.ndarray,
 
     # Generate RAG explanation using LTN model score
     ltn_score = scores.get("LTN", 0.5)
+    t1 = time.time()
     rag_explanation = get_rag_explanation(
         concepts,
         important_features,
         get_predicted_class(ltn_score, target_column),
         dataset_description
     )
+    rag_latency_ms = round((time.time() - t1) * 1000, 1)
 
     return {
         'scores': scores,
         'shap_values': collected_shap_values[2].flatten(),
         'satisfied_rules': satisfied_rules,
         'rag_explanation': rag_explanation,
-        'important_features': important_features
+        'important_features': important_features,
+        'prediction_latency_ms': prediction_latency_ms,
+        'rag_latency_ms': rag_latency_ms,
     }
