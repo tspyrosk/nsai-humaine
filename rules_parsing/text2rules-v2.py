@@ -101,6 +101,12 @@ def parse_and_write_to_files(predicates, sentences):
     with open(f"{output_path}/rules_only_rules.txt", "w") as text_file:
         text_file.write(rules_only_code)
 
+    # Persist the structured rules so the publish/export flow has a lossless
+    # source of truth (the LTN/Python strings above are not reversible).
+    structured = [json.loads(d["json"].model_dump_json()) for d in rules]
+    with open(f"{output_path}/rules_structured.json", "w") as json_file:
+        json.dump(structured, json_file, indent=2)
+
 with open(raw_rules_path, 'r') as file:
     sentences = file.read().split("\n")
 

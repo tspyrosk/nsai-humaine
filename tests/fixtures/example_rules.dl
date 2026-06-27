@@ -1,0 +1,23 @@
+% NSAI Rules Export — Breast Cancer Wisconsin example, Datalog form.
+%
+% File format (function-free rule subset of Prolog):
+%   predicate(Name, ColumnIndex, Threshold, Comparison).
+%     Comparison in { greater, less, equal }.
+%   composite(Name, Expression).
+%     Expression uses and/2, or/2, not/1 over simple predicate names.
+%   <target>(X) :- Body.
+%     Body connectives:  ,  conjunction (AND)
+%                        ;  disjunction (OR)
+%                        not (or \+)  negation (NOT)
+
+% ---- Simple predicates ----
+predicate(clump_thickness,    0, 0.5, greater).
+predicate(uniform_cell_size,  1, 0.5, less).
+predicate(mitoses,            8, 0.5, greater).
+
+% ---- Composite predicates ----
+composite(high_risk, and(clump_thickness, mitoses)).
+
+% ---- Rules ----
+target(X) :- clump_thickness(X), mitoses(X).
+target(X) :- (uniform_cell_size(X) ; mitoses(X)), not clump_thickness(X).

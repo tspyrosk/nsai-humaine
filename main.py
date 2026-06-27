@@ -21,6 +21,7 @@ from paths import *
 from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service, notebook_service, logging_service
 from services.image_service import QuotaExhaustedError as ImageQuotaError
 from services.text_service import QuotaExhaustedError as TextQuotaError
+from rules_parsing import rule_exporter
 from PIL import Image
 
 absl.logging.set_verbosity(absl.logging.ERROR)
@@ -206,6 +207,12 @@ def check_and_promote(token, version):
         (f"{staging_prefix}/feature_names.txt",     f"{prod_prefix}/feature_names.txt"),
         (f"{staging_prefix}/tag_vocabulary.json",   f"{prod_prefix}/tag_vocabulary.json"),
     ]
+
+    # The published rules file (if any) travels to production alongside the model.
+    rules_path = version_manifest.get("rules_path")
+    if rules_path:
+        artifacts.append((rules_path, f"{prod_prefix}/{os.path.basename(rules_path)}"))
+
     for src, dst in artifacts:
         tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(dst))
         try:
@@ -228,6 +235,8 @@ def check_and_promote(token, version):
         "scaler_path": f"{staging_prefix}/scaler.pkl",
         "feature_names_path": f"{staging_prefix}/feature_names.txt",
         "tag_vocabulary_path": f"{staging_prefix}/tag_vocabulary.json",
+        "rules_path": rules_path,
+        "rules_format": version_manifest.get("rules_format"),
     })
 
     # Update version manifest status
@@ -250,6 +259,12 @@ def publish_model_dialog():
         "The LTN model will be published to MinIO and made available to downstream consumers. "
         "Do you want to proceed?"
     )
+    rules_format = st.selectbox(
+        "Rules export format",
+        options=list(rule_exporter.SUPPORTED_FORMATS.keys()),
+        format_func=lambda ext: rule_exporter.SUPPORTED_FORMATS[ext],
+        help="The defined predicates and rules are published alongside the model in this format.",
+    )
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Yes", use_container_width=True):
@@ -269,6 +284,26 @@ def publish_model_dialog():
             minio_utils.minio_upload(token, MINIO_BUCKET, feat_names_object, FEATURE_NAMES_PATH)
             minio_utils.minio_upload(token, MINIO_BUCKET, tag_vocab_object,  TAG_VOCABULARY_PATH)
 
+            # Export the canonical rule set (predicates + composite predicates +
+            # rules) in the chosen format and publish it next to the model so it
+            # travels with the scaler/metadata. Rules are optional.
+            rules_object = None
+            rule_set = predicate_service.load_rule_set()
+            if rule_set:
+                rules_object = f"{staging_prefix}/rules.{rules_format}"
+                rules_text = rule_exporter.export_rule_set(rule_set, rules_format)
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=f".{rules_format}", delete=False
+                )
+                tmp.write(rules_text)
+                tmp.close()
+                try:
+                    minio_utils.minio_upload(token, MINIO_BUCKET, rules_object, tmp.name)
+                finally:
+                    os.unlink(tmp.name)
+            else:
+                st.warning("No rules defined — publishing without a rules file.")
+
             # Write version manifest (the version-level manifest lives one
             # level above the data-type subdir so check_and_promote can find
             # it without knowing the data type up front).
@@ -283,6 +318,8 @@ def publish_model_dialog():
                 "scaler_path": scaler_object,
                 "feature_names_path": feat_names_object,
                 "tag_vocabulary_path": tag_vocab_object,
+                "rules_path": rules_object,
+                "rules_format": rules_format if rules_object else None,
                 "bucket": MINIO_BUCKET,
                 "status": "pending_approval",
             })
@@ -295,6 +332,7 @@ def publish_model_dialog():
                 "status": "pending_approval",
                 "data_type": data_type,
                 "data_subdir": data_subdir,
+                "rules_format": rules_format if rules_object else None,
             })
             minio_utils.minio_write_json(token, MINIO_BUCKET, "published-models/index.json", index)
 
@@ -937,6 +975,56 @@ with tab2:
                 except Exception as e:
                     st.error(f"Failed to import Prolog file: {e}")
 
+    # ---- Import from other rule formats ----
+    with st.expander("Import predicates & rules from other formats "
+                     "(Datalog, SWRL, CLIPS, Drools, decision tree)"):
+        st.caption(
+            "Upload a rule file in one of the supported formats — Datalog "
+            "(.dl), SWRL (.swrl), CLIPS/Jess (.clp), Drools DRL (.drl), or a "
+            "pickled/joblib scikit-learn decision tree (.pkl/.joblib). See the "
+            "matching `tests/fixtures/example_rules.*` files for the expected "
+            "format. The format is detected from the file extension."
+        )
+        rules_upload = st.file_uploader(
+            "Upload rule file",
+            type=["dl", "swrl", "clp", "drl", "pkl", "joblib"],
+            key="rules_format_upload",
+        )
+        if rules_upload is not None and st.button("Import", key="rules_format_import_btn"):
+            if st.session_state.target_column is None:
+                st.warning("Load a dataset and select a target column before importing.")
+            else:
+                ext = rules_upload.name.rsplit(".", 1)[-1].lower()
+                importer = predicate_service.IMPORTERS_BY_EXT.get(ext)
+                if importer is None:
+                    st.error(f"Unsupported file type: .{ext}")
+                else:
+                    try:
+                        result = importer(
+                            rules_upload.getvalue(),
+                            st.session_state.target_column,
+                        )
+                        st.session_state.predicates = result["predicates"]
+                        st.session_state.composite_predicates = result["composite_predicates"]
+                        st.session_state.rules = result["rule_texts"]
+                        st.session_state.rules_saved = True
+                        logging_service.append_event(logging_service.make_event(
+                            "DomainExpert", "human",
+                            f"imported {len(result['predicates'])} predicate(s), "
+                            f"{len(result['composite_predicates'])} composite(s), "
+                            f"{len(result['rule_texts'])} rule(s) from .{ext} file",
+                            event_type="rule_authoring",
+                        ))
+                        st.success(
+                            f"Imported {len(result['predicates'])} predicates, "
+                            f"{len(result['composite_predicates'])} composite predicates, "
+                            f"and {len(result['rule_texts'])} rules from .{ext} file. "
+                            "You can now proceed to the Train tab."
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to import .{ext} file: {e}")
+
     def display_predicates_and_generate_code():
         st.subheader("Defined Predicates")
         if st.session_state.predicates:
@@ -1182,7 +1270,11 @@ with tab3:
     save_rules = st.button("Save Rules")
     if save_rules:
         _t0 = time.time()
-        ltn_code, rules_code = predicate_service.save_and_parse_rules(selected_rules)
+        ltn_code, rules_code = predicate_service.save_and_parse_rules(
+            selected_rules,
+            st.session_state.predicates,
+            st.session_state.composite_predicates,
+        )
         _rule_parse_latency_ms = round((time.time() - _t0) * 1000, 1)
         st.session_state.rules_saved = True
         logging_service.append_event(logging_service.make_event(

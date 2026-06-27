@@ -1,0 +1,21 @@
+# NSAI Rules Export — Breast Cancer Wisconsin example, SWRL form.
+#
+# Rule syntax (human-readable SWRL):  atom ^ atom ^ ... -> atom
+# Core SWRL antecedents are conjunction-only (no OR / NOT).
+#
+# Predicate & composite metadata travel in reserved declaration atoms that
+# have no consequent:
+#   Predicate(Name, ColumnIndex, Threshold, Comparison)
+#   Composite(Name, Expression)        # and(...)/or(...)/not(...) over names
+
+# ---- Simple predicates ----
+Predicate(clump_thickness,   0, 0.5, greater)
+Predicate(uniform_cell_size, 1, 0.5, less)
+Predicate(mitoses,           8, 0.5, greater)
+
+# ---- Composite predicates ----
+Composite(high_risk, and(clump_thickness, mitoses))
+
+# ---- Rules (conjunctive) ----
+clump_thickness(?x) ^ mitoses(?x) -> target(?x)
+uniform_cell_size(?x) ^ mitoses(?x) -> target(?x)

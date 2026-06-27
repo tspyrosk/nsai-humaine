@@ -1,24 +1,27 @@
-"""Import an NSAI rule set from a Prolog (.pl) file.
+"""Import an NSAI rule set from a Datalog (.dl) file.
 
-The accepted Prolog subset is documented at the top of
-``tests/fixtures/example_rules.pl``. Returns the canonical importer dict
-described in ``rules_parsing/canonical.py``.
+Datalog is the function-free, rule-based subset of Prolog used by deductive
+databases. The accepted convention mirrors the Prolog one (see
+``tests/fixtures/example_rules.dl``):
 
-Format-agnostic lowering and rendering live in ``canonical``; this module only
-owns the Prolog grammar and the Transformer that emits the shared
-intermediate-node shapes.
+    predicate(Name, ColumnIndex, Threshold, Comparison).
+    composite(Name, Expression).        % Expression: and/2, or/2, not/1
+    target(X) :- Body.
+
+Body connectives:
+    ,         conjunction (AND)
+    ;         disjunction (OR)
+    not / \\+  negation (NOT)
+
+Compared with the Prolog importer the only grammatical difference is that
+Datalog spells negation with the ``not`` keyword (``\\+`` is also accepted for
+convenience). Everything else — lowering, rendering — is shared via
+``canonical``.
 """
 
 from lark import Lark, Transformer, v_args
 
 from rules_parsing import canonical
-# Re-exported for backwards compatibility (callers historically imported these
-# rendering helpers from prolog_importer).
-from rules_parsing.canonical import (  # noqa: F401
-    rule_to_text,
-    rule_to_ltn,
-    rule_to_python_lambda,
-)
 
 
 _GRAMMAR = r"""
@@ -31,7 +34,7 @@ _GRAMMAR = r"""
                 | disjunction ";" conjunction   -> or_expr
     ?conjunction: unary
                 | conjunction "," unary          -> and_expr
-    ?unary: "\\+" unary                          -> not_expr
+    ?unary: ("not"|"\\+") unary                  -> not_expr
           | "(" disjunction ")"
           | compound
 
@@ -52,8 +55,6 @@ _GRAMMAR = r"""
 
 @v_args(inline=True)
 class _Tree(Transformer):
-    """Lower the parse tree to the shared intermediate-node shapes."""
-
     def number(self, tok):
         s = str(tok)
         return float(s) if "." in s or "e" in s.lower() else int(s)
@@ -82,13 +83,15 @@ class _Tree(Transformer):
         return list(clauses)
 
 
+# ``not`` is a keyword here, so it must win over the CNAME terminal; the Earley
+# parser handles the keyword/identifier overlap without extra priorities.
 _PARSER = Lark(_GRAMMAR, parser="lalr", transformer=_Tree())
 
 
-def import_prolog_source(source):
+def import_datalog_source(source):
     return canonical.clauses_to_canonical(_PARSER.parse(source))
 
 
-def import_prolog_file(path):
+def import_datalog_file(path):
     with open(path) as f:
-        return import_prolog_source(f.read())
+        return import_datalog_source(f.read())

@@ -1,0 +1,30 @@
+// NSAI Rules Export — Breast Cancer Wisconsin example, Drools DRL form.
+//
+// Declarations:
+//   predicate( Name, ColumnIndex, Threshold, Comparison )
+//   composite( Name, and(...) )            // and/or/not over predicate names
+// Rules use the standard DRL shape; antecedent connectives are and/or/not with
+// parentheses for grouping, and a predicate atom is a nullary pattern P().
+
+// ---- Simple predicates ----
+predicate( clump_thickness,   0, 0.5, greater )
+predicate( uniform_cell_size, 1, 0.5, less )
+predicate( mitoses,           8, 0.5, greater )
+
+// ---- Composite predicates ----
+composite( high_risk, and(clump_thickness, mitoses) )
+
+// ---- Rules ----
+rule "r1"
+when
+    clump_thickness() and mitoses()
+then
+    target();
+end
+
+rule "r2"
+when
+    ( uniform_cell_size() or mitoses() ) and not clump_thickness()
+then
+    target();
+end
