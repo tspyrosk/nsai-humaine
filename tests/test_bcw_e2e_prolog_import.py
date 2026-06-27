@@ -115,7 +115,7 @@ class TestBCWSimpleViaProlog:
         click_tab(page, "Predicates")
 
         # Open the importer expander.
-        page.get_by_text("Import predicates & rules from Prolog file (.pl)").click()
+        page.get_by_text("Import predicates & rules from a file").first.click()
         page.wait_for_timeout(300)
 
         # Upload the .pl file. Uploaders in DOM order:

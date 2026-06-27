@@ -937,57 +937,20 @@ with tab1:
 with tab2:
     st.header("Define Predicates")
 
-    # ---- Import from Prolog (.pl) file ----
-    with st.expander("Import predicates & rules from Prolog file (.pl)"):
+    # ---- Import predicates & rules from a file (all supported formats) ----
+    with st.expander("Import predicates & rules from a file "
+                     "(Prolog, Datalog, SWRL, CLIPS, Drools, decision tree)"):
         st.caption(
-            "Skip the manual setup by uploading a Prolog file that defines "
-            "predicates, composite predicates, and rules. See "
-            "`tests/fixtures/example_rules.pl` for the expected format."
-        )
-        prolog_upload = st.file_uploader("Upload .pl file", type=["pl"], key="prolog_upload")
-        if prolog_upload is not None and st.button("Import", key="prolog_import_btn"):
-            if st.session_state.target_column is None:
-                st.warning("Load a dataset and select a target column before importing.")
-            else:
-                try:
-                    result = predicate_service.import_from_prolog(
-                        prolog_upload.getvalue(),
-                        st.session_state.target_column,
-                    )
-                    st.session_state.predicates = result["predicates"]
-                    st.session_state.composite_predicates = result["composite_predicates"]
-                    st.session_state.rules = result["rule_texts"]
-                    st.session_state.rules_saved = True
-                    logging_service.append_event(logging_service.make_event(
-                        "DomainExpert", "human",
-                        f"imported {len(result['predicates'])} predicate(s), "
-                        f"{len(result['composite_predicates'])} composite(s), "
-                        f"{len(result['rule_texts'])} rule(s) from Prolog file",
-                        event_type="rule_authoring",
-                    ))
-                    st.success(
-                        f"Imported {len(result['predicates'])} predicates, "
-                        f"{len(result['composite_predicates'])} composite predicates, "
-                        f"and {len(result['rule_texts'])} rules. "
-                        "You can now proceed to the Train tab."
-                    )
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to import Prolog file: {e}")
-
-    # ---- Import from other rule formats ----
-    with st.expander("Import predicates & rules from other formats "
-                     "(Datalog, SWRL, CLIPS, Drools, decision tree)"):
-        st.caption(
-            "Upload a rule file in one of the supported formats — Datalog "
-            "(.dl), SWRL (.swrl), CLIPS/Jess (.clp), Drools DRL (.drl), or a "
-            "pickled/joblib scikit-learn decision tree (.pkl/.joblib). See the "
-            "matching `tests/fixtures/example_rules.*` files for the expected "
-            "format. The format is detected from the file extension."
+            "Skip the manual setup by uploading a rule file. Supported formats: "
+            "Prolog (.pl), Datalog (.dl), SWRL (.swrl), CLIPS/Jess (.clp), "
+            "Drools DRL (.drl), or a pickled/joblib scikit-learn decision tree "
+            "(.pkl/.joblib). The format is detected from the file extension. "
+            "See the matching `tests/fixtures/example_rules.*` files for the "
+            "expected format."
         )
         rules_upload = st.file_uploader(
             "Upload rule file",
-            type=["dl", "swrl", "clp", "drl", "pkl", "joblib"],
+            type=["pl", "dl", "swrl", "clp", "drl", "pkl", "joblib"],
             key="rules_format_upload",
         )
         if rules_upload is not None and st.button("Import", key="rules_format_import_btn"):
