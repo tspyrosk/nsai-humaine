@@ -988,6 +988,36 @@ with tab2:
                     except Exception as e:
                         st.error(f"Failed to import .{ext} file: {e}")
 
+    # ---- Export predicates & rules to a file ----
+    with st.expander("Export predicates & rules to a file"):
+        export_rule_set = predicate_service.load_rule_set()
+        if not export_rule_set or not (
+            export_rule_set.get("predicates") or export_rule_set.get("rules")
+        ):
+            st.caption(
+                "Define or import predicates & rules first (and save your rules), "
+                "then export them here in any supported format."
+            )
+        else:
+            export_format = st.selectbox(
+                "Export format",
+                options=list(rule_exporter.SUPPORTED_FORMATS.keys()),
+                format_func=lambda ext: rule_exporter.SUPPORTED_FORMATS[ext],
+                key="rules_export_format",
+            )
+            try:
+                export_text = rule_exporter.export_rule_set(export_rule_set, export_format)
+                st.code(export_text)
+                st.download_button(
+                    "Download rules file",
+                    data=export_text,
+                    file_name=f"rules.{export_format}",
+                    mime="application/json" if export_format == "json" else "text/plain",
+                    key="rules_export_download",
+                )
+            except Exception as e:
+                st.error(f"Failed to export rules: {e}")
+
     def display_predicates_and_generate_code():
         st.subheader("Defined Predicates")
         if st.session_state.predicates:
