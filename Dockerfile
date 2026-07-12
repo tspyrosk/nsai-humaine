@@ -32,6 +32,8 @@ COPY nginx.conf /etc/nginx/nginx.conf
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 
 ENV PYTHONPATH="/app"
+# Kubeflow's notebook controller overrides this with /notebook/<namespace>/<server-name>
+ENV NB_PREFIX=""
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_SERVER_FILEWATCHERTYPE=none
 ENV STREAMLIT_GLOBAL_DISABLEWATCHDOGWARNING=true
