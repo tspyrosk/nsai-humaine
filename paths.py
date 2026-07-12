@@ -17,7 +17,8 @@ LTN_RULES_PATH = os.path.join(OUTPUT_DIR, "ltn_rules.txt")
 
 #NOTEBOOK PATHS
 NOTEBOOKS_DIR = os.path.join(BASE_DIR, "notebooks")
-JUPYTER_URL = os.getenv("JUPYTER_URL", "/jupyter")
+# NB_PREFIX is set by Kubeflow's notebook controller (/notebook/<namespace>/<server-name>)
+JUPYTER_URL = os.getenv("JUPYTER_URL", os.getenv("NB_PREFIX", "") + "/jupyter")
 
 #SCRIPT PATHS
 SPLIT_DATASET_SCRIPT = os.path.join(BASE_DIR, "dataset", "split_dataset.py")
