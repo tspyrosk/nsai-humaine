@@ -1,11 +1,7 @@
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
-    build-essential \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+# No compilers needed: every dependency in inference/requirements.txt ships
+# a prebuilt manylinux wheel for Python 3.12.
 
 WORKDIR /app
 

@@ -1,0 +1,53 @@
+{
+  "predicates": [
+    {
+      "name": "clump_thickness",
+      "column_index": 0,
+      "threshold": 0.5,
+      "comparison": "Greater",
+      "is_boolean": false
+    },
+    {
+      "name": "uniform_cell_size",
+      "column_index": 1,
+      "threshold": 0.5,
+      "comparison": "Less",
+      "is_boolean": false
+    },
+    {
+      "name": "mitoses",
+      "column_index": 8,
+      "threshold": 0.5,
+      "comparison": "Greater",
+      "is_boolean": false
+    }
+  ],
+  "composite_predicates": [
+    {
+      "name": "high_risk",
+      "expression": "And(clump_thickness, mitoses)"
+    }
+  ],
+  "rules": [
+    {
+      "if_part": {
+        "operator": "AND",
+        "arg1": {"name": "clump_thickness"},
+        "arg2": {"name": "mitoses"}
+      },
+      "then_part": {"name": "target"}
+    },
+    {
+      "if_part": {
+        "operator": "AND",
+        "arg1": {
+          "operator": "OR",
+          "arg1": {"name": "uniform_cell_size"},
+          "arg2": {"name": "mitoses"}
+        },
+        "arg2": {"operator": "NOT", "name": "clump_thickness"}
+      },
+      "then_part": {"name": "target"}
+    }
+  ]
+}

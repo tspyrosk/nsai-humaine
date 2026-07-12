@@ -8,6 +8,8 @@ import time
 import json
 import warnings
 warnings.filterwarnings("ignore")
+import absl.logging
+absl.logging.set_verbosity(absl.logging.ERROR)
 
 from sklearn.model_selection import train_test_split
 import sys
