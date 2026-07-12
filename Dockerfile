@@ -27,6 +27,7 @@ COPY . .
 RUN pip install .
 
 RUN mkdir -p /app/input /app/output /app/notebooks
+RUN date -u +"build %Y-%m-%d %H:%M:%S UTC" > /app/build-info
 
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY supervisord.conf /etc/supervisor/supervisord.conf
