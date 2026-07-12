@@ -106,11 +106,18 @@ def _defrule_to_clause(form):
 
     body = canonical.fold_and([_ce_to_node(ce) for ce in ces])
 
-    # Consequent: (assert (Target ?x)) — pull the asserted pattern's head.
+    # Consequent: (assert (Target ?x)) — pull the asserted pattern's head. A
+    # negative goal is asserted negated: (assert (not (Target ?x))).
     action = actions[0]
     asserted = action[1] if isinstance(action, list) and action[0] == "assert" else action
-    head_name = asserted[0] if isinstance(asserted, list) else asserted
-    return {"_kind": "rule", "head": canonical.compound(head_name), "body": body}
+    if isinstance(asserted, list) and asserted and asserted[0] == "not":
+        pattern = asserted[1]
+        name = pattern[0] if isinstance(pattern, list) else pattern
+        head = canonical.not_node(canonical.compound(name))
+    else:
+        name = asserted[0] if isinstance(asserted, list) else asserted
+        head = canonical.compound(name)
+    return {"_kind": "rule", "head": head, "body": body}
 
 
 def _form_to_clause(form):

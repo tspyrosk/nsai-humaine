@@ -169,6 +169,24 @@ def body_to_rule_part(node):
     raise ValueError(f"Unsupported body node: {node}")
 
 
+def head_to_then_part(node):
+    """Convert a rule-head node into the ``then_part`` dict the UI/codegen use.
+
+    A plain compound head → ``{"name": ...}``. A NOT-wrapped compound head — an
+    imported *negative goal*, e.g. Prolog ``\\+ target(X) :- Body`` — →
+    ``{"operator": "NOT", "name": ...}``, so a rule can conclude the negative
+    class (``Not(target(x,f(x)))`` in the LTN layer).
+    """
+    if node["_kind"] == "compound":
+        return {"name": node["name"]}
+    if node["_kind"] == "not":
+        inner = node["arg"]
+        if inner["_kind"] != "compound":
+            raise ValueError("A negated rule head must wrap a single predicate call")
+        return {"operator": "NOT", "name": inner["name"]}
+    raise ValueError(f"Unsupported rule head: {node}")
+
+
 def parse_predicate_fact(comp):
     """predicate(Name, ColIdx, Threshold, Comparison) → predicate dict."""
     name_node, column_index, threshold, comparison_node = comp["args"]
@@ -212,7 +230,7 @@ def clauses_to_canonical(clauses):
         elif clause["_kind"] == "rule":
             rules.append({
                 "if_part": body_to_rule_part(clause["body"]),
-                "then_part": {"name": clause["head"]["name"]},
+                "then_part": head_to_then_part(clause["head"]),
             })
         else:
             raise ValueError(f"Unexpected clause: {clause}")

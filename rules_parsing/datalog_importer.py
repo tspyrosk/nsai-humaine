@@ -27,7 +27,10 @@ from rules_parsing import canonical
 _GRAMMAR = r"""
     start: clause+
 
-    clause: compound (":-" body)? "."
+    clause: head (":-" body)? "."
+
+    ?head: compound
+         | ("not"|"\\+") compound                -> neg_head
 
     ?body: disjunction
     ?disjunction: conjunction
@@ -74,10 +77,15 @@ class _Tree(Transformer):
     def or_expr(self, left, right):
         return canonical.or_node(left, right)
 
-    def clause(self, compound, body=None):
+    def neg_head(self, comp):
+        return canonical.not_node(comp)
+
+    def clause(self, head, body=None):
         if body is None:
-            return {"_kind": "fact", "compound": compound}
-        return {"_kind": "rule", "head": compound, "body": body}
+            if head.get("_kind") == "not":
+                raise ValueError("A negated head requires a rule body")
+            return {"_kind": "fact", "compound": head}
+        return {"_kind": "rule", "head": head, "body": body}
 
     def start(self, *clauses):
         return list(clauses)

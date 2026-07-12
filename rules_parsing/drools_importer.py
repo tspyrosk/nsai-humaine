@@ -47,7 +47,8 @@ _GRAMMAR = r"""
           | atom
 
     atom: CNAME "(" ")"
-    rhs: CNAME "(" ")" ";"?
+    rhs: CNAME "(" ")" ";"?           -> pos_rhs
+       | "not" CNAME "(" ")" ";"?     -> neg_rhs
 
     number: SIGNED_NUMBER
 
@@ -104,11 +105,15 @@ class _Tree(Transformer):
         comp = canonical.compound("composite", [canonical.compound(name), expr])
         return {"_kind": "fact", "compound": comp}
 
-    def rhs(self, name):
-        return str(name)
+    def pos_rhs(self, name):
+        return canonical.compound(str(name))
+
+    def neg_rhs(self, name):
+        # A negative goal: the rule concludes the negated target class.
+        return canonical.not_node(canonical.compound(str(name)))
 
     def rule_def(self, _name, lhs, rhs):
-        return {"_kind": "rule", "head": canonical.compound(rhs), "body": lhs}
+        return {"_kind": "rule", "head": rhs, "body": lhs}
 
     def start(self, *clauses):
         return list(clauses)

@@ -60,10 +60,16 @@ def _logic_render(rule_set, *, not_kw):
         node = canonical.parse_composite_expression(c["expression"])
         lines.append(f"composite({c['name']}, {_functor_expr(node)}).")
     for rule in rule_set.get("rules", []):
-        head = rule["then_part"]["name"]
+        head = _logic_head(rule["then_part"], not_kw=not_kw)
         body = _logic_body(rule["if_part"], not_kw=not_kw)
-        lines.append(f"{head}(X) :- {body}.")
+        lines.append(f"{head} :- {body}.")
     return "\n".join(lines) + "\n"
+
+
+def _logic_head(then_part, *, not_kw):
+    """Render a rule head, negating it (``\\+``/``not``) for a negative goal."""
+    call = f"{then_part['name']}(X)"
+    return f"{not_kw} {call}" if then_part.get("operator") == "NOT" else call
 
 
 def _functor_expr(node):
@@ -107,9 +113,11 @@ def _render_clips(rule_set):
         node = canonical.parse_composite_expression(c["expression"])
         lines.append(f"(composite {c['name']} {_clips_expr(node)})")
     for i, rule in enumerate(rule_set.get("rules", []), start=1):
-        head = rule["then_part"]["name"]
+        tp = rule["then_part"]
         ce = _clips_ce(rule["if_part"])
-        lines.append(f"(defrule r{i} {ce} => (assert ({head} ?x)))")
+        pattern = f"({tp['name']} ?x)"
+        asserted = f"(not {pattern})" if tp.get("operator") == "NOT" else pattern
+        lines.append(f"(defrule r{i} {ce} => (assert {asserted}))")
     return "\n".join(lines) + "\n"
 
 
@@ -145,9 +153,10 @@ def _render_drools(rule_set):
         node = canonical.parse_composite_expression(c["expression"])
         lines.append(f"composite( {c['name']}, {_functor_expr(node)} )")
     for i, rule in enumerate(rule_set.get("rules", []), start=1):
-        head = rule["then_part"]["name"]
+        tp = rule["then_part"]
         lhs = _drools_lhs(rule["if_part"])
-        lines.append(f'rule "r{i}"\nwhen\n    {lhs}\nthen\n    {head}();\nend')
+        head = f"not {tp['name']}();" if tp.get("operator") == "NOT" else f"{tp['name']}();"
+        lines.append(f'rule "r{i}"\nwhen\n    {lhs}\nthen\n    {head}\nend')
     return "\n".join(lines) + "\n"
 
 
@@ -184,8 +193,9 @@ def _render_swrl(rule_set):
         lines.append(f"Composite({c['name']}, {_functor_expr(node)})")
     for rule in rule_set.get("rules", []):
         leaves = _conjunctive_leaves(rule["if_part"])
-        if leaves is None:
-            # SWRL cannot express OR/NOT in the antecedent — skip with a note.
+        if leaves is None or rule["then_part"].get("operator") == "NOT":
+            # SWRL cannot express OR/NOT in the antecedent or a negated
+            # consequent — skip with a note.
             lines.append(f"# skipped non-conjunctive rule: {canonical.rule_to_text(rule)}")
             continue
         head = rule["then_part"]["name"]
