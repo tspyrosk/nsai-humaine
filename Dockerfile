@@ -40,4 +40,7 @@ ENV STREAMLIT_GLOBAL_DISABLEWATCHDOGWARNING=true
 
 EXPOSE 8888
 
-CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]
