@@ -247,11 +247,10 @@ class TestBCWSimple:
         expect(page.get_by_text("Predicates saved")).to_be_visible(timeout=10_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05b_predicates_saved.png")
 
-    # ── Tab 3: Rules ──────────────────────────────────────────────────────────
+    # ── Tab 2: Rules section (same tab as predicates) ─────────────────────────
 
     def test_06_add_and_save_rule(self, page_with_app: Page):
         page = page_with_app
-        click_tab(page, "Rules")
 
         rule_text = (
             "if the clump thickness is high but mitoses is low "
@@ -271,7 +270,7 @@ class TestBCWSimple:
         expect(page.get_by_text("Rules saved")).to_be_visible(timeout=15_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_06_rules_saved.png")
 
-    # ── Tab 4: Train ──────────────────────────────────────────────────────────
+    # ── Tab 3: Train ──────────────────────────────────────────────────────────
 
     def test_07_train_models(self, page_with_app: Page):
         page = page_with_app

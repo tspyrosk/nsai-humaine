@@ -412,7 +412,7 @@ def create_metric_expander(results, result_name, start_expanded=False):
                 write_results(results, "LTN", result_name, comp_model_name="MLP")
 
 
-tab1, tab2, tab_rules, tab3, tab4, tab5 = st.tabs(["Load", "Predicates", "Rules", "Train", "Explain", "Models"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Load", "Predicates & Rules", "Train", "Explain", "Models"])
 
 with tab1:
     st.header("Upload Dataset")
@@ -943,7 +943,7 @@ with tab1:
 
 
 with tab2:
-    st.header("Define Predicates")
+    st.header("Define Predicates & Rules")
 
     # ---- Import predicates & rules from a file (all supported formats) ----
     with st.expander("Import predicates & rules from a file "
@@ -996,7 +996,7 @@ with tab2:
                             f"Imported {len(result['predicates'])} predicates, "
                             f"{len(result['composite_predicates'])} composite predicates, "
                             f"and {len(result['rule_texts'])} rules from .{ext} file. "
-                            "Review the predicates below and the rules on the Rules tab."
+                            "Review the imported predicates and rules below."
                         )
                         st.rerun()
                     except Exception as e:
@@ -1084,7 +1084,7 @@ with tab2:
                 f"{len(st.session_state.composite_predicates)} composite(s)",
                 event_type="predicate_definition"
             ))
-            st.success("Predicates saved — continue on the Rules tab.")
+            st.success("Predicates saved — you can now define rules below.")
 
     st.divider()
 
@@ -1244,12 +1244,13 @@ with tab2:
                     elif submit_composite and name_exists(comp_pred_name):
                         st.warning(f"A predicate or composite predicate named '{comp_pred_name}' already exists. Please choose another name.")
 
-with tab_rules:
-    st.header("Define Rules")
+    # ---- Rules section (same tab, so predicates and rules can be managed together) ----
+    st.divider()
+    st.subheader("Define Rules")
 
     has_predicates = bool(st.session_state.predicates or st.session_state.composite_predicates)
     if not has_predicates or not st.session_state.predicates_saved:
-        st.info("👆 Please define and save your predicates on the Predicates tab first.")
+        st.info("👆 Please define and save your predicates above first.")
     else:
         rule_text = st.text_input(
             "Enter rule in natural language:",
@@ -1364,7 +1365,7 @@ with tab_rules:
 with tab3:
     st.header("Train Models")
 
-    # Training is gated on a finalized rule set from the Rules tab.
+    # Training is gated on a finalized rule set from the Predicates & Rules tab.
     if st.session_state.get('rules_saved', False):
         st.subheader("Step 1: Choose Training Method")
 
@@ -1456,7 +1457,7 @@ with tab3:
         else:
             st.info("No trained models found. Use one of the training methods above.")
     else:
-        st.info("👆 Please define and save your rules on the Rules tab first to proceed with training.")
+        st.info("👆 Please define and save your rules on the Predicates & Rules tab first to proceed with training.")
 
 with tab4:
     if st.session_state.X_test is not None:

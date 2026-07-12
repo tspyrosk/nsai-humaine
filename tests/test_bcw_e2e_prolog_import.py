@@ -130,19 +130,18 @@ class TestBCWSimpleViaProlog:
         expect(page.get_by_text("Imported 2 predicates")).to_be_visible(timeout=10_000)
         page.screenshot(path=str(SNAPSHOT_DIR / "snap_pl_04_prolog_imported.png"))
 
-    # ── Tab 3: Rules — rules already saved by the import ─────────────────────
+    # ── Tab 2: predicates & rules populated by the import ────────────────────
 
     def test_05_verify_rules_loaded(self, page_with_app: Page):
         page = page_with_app
 
-        # The imported predicates appear in the always-visible list on the
-        # Predicates tab (each with a Remove button).
+        # The imported predicates appear in the always-visible list
+        # (each with a Remove button).
         expect(page.locator("strong").filter(has_text="high_clump_thickness")).to_be_visible(timeout=10_000)
         expect(page.locator("strong").filter(has_text="low_mitoses")).to_be_visible(timeout=10_000)
 
-        # The imported rule appears on the Rules tab with its encoded form
-        # (the text shows both as the rule title and in the "Understood as" caption).
-        click_tab(page, "Rules")
+        # The imported rule appears in the rules section below with its encoded
+        # form (the text shows both as the rule title and in the caption).
         expect(page.get_by_text(EXPECTED_RULE_TEXT).first).to_be_visible(timeout=10_000)
         page.screenshot(path=str(SNAPSHOT_DIR / "snap_pl_05_rules_loaded.png"))
 
