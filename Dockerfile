@@ -26,16 +26,22 @@ COPY . .
 
 RUN pip install .
 
-RUN mkdir -p /app/input /app/output /app/notebooks
+RUN mkdir -p /app/input /app/output /app/notebooks /etc/nginx/nb-prefix
+RUN date -u +"build %Y-%m-%d %H:%M:%S UTC" > /app/build-info
 
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 
 ENV PYTHONPATH="/app"
+# Kubeflow's notebook controller overrides this with /notebook/<namespace>/<server-name>
+ENV NB_PREFIX=""
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_SERVER_FILEWATCHERTYPE=none
 ENV STREAMLIT_GLOBAL_DISABLEWATCHDOGWARNING=true
 
 EXPOSE 8888
 
-CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]
