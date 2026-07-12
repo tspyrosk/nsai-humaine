@@ -219,8 +219,8 @@ class TestBCWSimple:
         expect(page.locator("strong").filter(has_text="low_mitoses")).to_be_visible(timeout=8_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05_predicate_mitoses.png")
 
-    def test_05a_remove_predicate_roundtrip(self, page_with_app: Page):
-        """A freshly added predicate can be removed again from the visible list."""
+    def test_05a_edit_and_remove_predicate_roundtrip(self, page_with_app: Page):
+        """A freshly added predicate can be edited inline and then removed."""
         page = page_with_app
 
         select_streamlit_option(page, 1, "Bland Chromatin")
@@ -234,8 +234,19 @@ class TestBCWSimple:
 
         expect(page.locator("strong").filter(has_text="tmp_predicate")).to_be_visible(timeout=8_000)
 
-        # Each list row is one st.columns() horizontal block with its own Remove button
+        # Each list row is one st.columns() horizontal block with Edit/Remove buttons
         row = page.locator("[data-testid='stHorizontalBlock']").filter(has_text="tmp_predicate").first
+        row.get_by_role("button", name="Edit").click()
+        wait_for_streamlit(page)
+
+        # The inline editor is a bordered container; rename the predicate
+        editor = page.locator("[data-testid='stVerticalBlockBorderWrapper']").filter(has_text="Editing").first
+        editor.locator("[data-testid='stTextInput'] input").first.fill("tmp_predicate_edited")
+        editor.get_by_role("button", name="Save changes").click()
+        expect(page.locator("strong").filter(has_text="tmp_predicate_edited")).to_be_visible(timeout=8_000)
+        page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05a_predicate_edited.png")
+
+        row = page.locator("[data-testid='stHorizontalBlock']").filter(has_text="tmp_predicate_edited").first
         row.get_by_role("button", name="Remove").click()
         expect(page.locator("strong").filter(has_text="tmp_predicate")).not_to_be_visible(timeout=8_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05a_predicate_removed.png")
@@ -243,7 +254,7 @@ class TestBCWSimple:
     def test_05b_save_predicates(self, page_with_app: Page):
         page = page_with_app
 
-        page.get_by_role("button", name="Save Predicates").click()
+        page.get_by_role("button", name="Save Predicates & Rules").click()
         expect(page.get_by_text("Predicates saved")).to_be_visible(timeout=10_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05b_predicates_saved.png")
 
@@ -266,8 +277,8 @@ class TestBCWSimple:
         expect(page.get_by_text("THEN malignant")).to_be_visible(timeout=10_000)
 
         # Save — pure file rendering, no LLM, effectively instant
-        page.get_by_role("button", name="Save Rules").click()
-        expect(page.get_by_text("Rules saved")).to_be_visible(timeout=15_000)
+        page.get_by_role("button", name="Save Predicates & Rules").click()
+        expect(page.get_by_text("continue on the Train tab")).to_be_visible(timeout=15_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_06_rules_saved.png")
 
     # ── Tab 3: Train ──────────────────────────────────────────────────────────
