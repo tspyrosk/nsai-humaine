@@ -26,7 +26,7 @@ COPY . .
 
 RUN pip install .
 
-RUN mkdir -p /app/input /app/output /app/notebooks
+RUN mkdir -p /app/input /app/output /app/notebooks /etc/nginx/nb-prefix
 RUN date -u +"build %Y-%m-%d %H:%M:%S UTC" > /app/build-info
 
 COPY nginx.conf /etc/nginx/nginx.conf
