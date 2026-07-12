@@ -21,4 +21,3 @@ JUPYTER_URL = os.getenv("JUPYTER_URL", "/jupyter")
 
 #SCRIPT PATHS
 SPLIT_DATASET_SCRIPT = os.path.join(BASE_DIR, "dataset", "split_dataset.py")
-TEXT2RULES_SCRIPT = os.path.join(BASE_DIR, "rules_parsing", "text2rules-v2.py")

@@ -219,45 +219,63 @@ class TestBCWSimple:
         expect(page.locator("strong").filter(has_text="low_mitoses")).to_be_visible(timeout=8_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05_predicate_mitoses.png")
 
-    # ── Tab 3: Train ──────────────────────────────────────────────────────────
+    def test_05a_remove_predicate_roundtrip(self, page_with_app: Page):
+        """A freshly added predicate can be removed again from the visible list."""
+        page = page_with_app
+
+        select_streamlit_option(page, 1, "Bland Chromatin")
+
+        form = page.locator("[data-testid='stForm']").first
+        form.locator("input[type='text']").fill("tmp_predicate")
+        form.locator("[data-testid='stNumberInputField']").fill("5.0")
+        form.locator("[role='combobox']").click()
+        page.locator("[role='option']").filter(has_text="Greater").first.click()
+        form.get_by_role("button", name="Add Predicate").click()
+
+        expect(page.locator("strong").filter(has_text="tmp_predicate")).to_be_visible(timeout=8_000)
+
+        # Each list row is one st.columns() horizontal block with its own Remove button
+        row = page.locator("[data-testid='stHorizontalBlock']").filter(has_text="tmp_predicate").first
+        row.get_by_role("button", name="Remove").click()
+        expect(page.locator("strong").filter(has_text="tmp_predicate")).not_to_be_visible(timeout=8_000)
+        page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05a_predicate_removed.png")
+
+    def test_05b_save_predicates(self, page_with_app: Page):
+        page = page_with_app
+
+        page.get_by_role("button", name="Save Predicates").click()
+        expect(page.get_by_text("Predicates saved")).to_be_visible(timeout=10_000)
+        page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_05b_predicates_saved.png")
+
+    # ── Tab 3: Rules ──────────────────────────────────────────────────────────
 
     def test_06_add_and_save_rule(self, page_with_app: Page):
         page = page_with_app
-        click_tab(page, "Train")
+        click_tab(page, "Rules")
 
         rule_text = (
             "if the clump thickness is high but mitoses is low "
             "then the tumor is malignant"
         )
 
-        # Step 1: type the rule and send it to the LLM pipeline via "Add Rule"
-        page.get_by_label("Enter rule:").fill(rule_text)
+        # "Add Rule" triggers the LLM parse — can take several minutes
+        page.get_by_label("Enter rule in natural language:").fill(rule_text)
         page.get_by_role("button", name="Add Rule").click()
 
-        # Wait for rerun so the pill appears
-        stop_btn = page.get_by_role("button", name="Stop")
-        try:
-            stop_btn.wait_for(state="visible", timeout=2_000)
-            stop_btn.wait_for(state="hidden", timeout=15_000)
-        except Exception:
-            pass
+        # The rule shows up in the list with its encoded form once parsing finishes
+        expect(page.get_by_text("Understood as:")).to_be_visible(timeout=180_000)
+        expect(page.get_by_text("THEN malignant")).to_be_visible(timeout=10_000)
 
-        # Step 2: select the pill — Streamlit renders st.pills as data-testid='stButtonGroup'
-        pills_container = page.locator("[data-testid='stButtonGroup']")
-        expect(pills_container).to_be_visible(timeout=10_000)
-        pill = pills_container.locator("[data-testid='stBaseButton-pills']").filter(has_text="clump thickness")
-        expect(pill).to_be_visible(timeout=10_000)
-        pill.click()
-
-        # Step 3: save — triggers LLM parse, can take several minutes
+        # Save — pure file rendering, no LLM, effectively instant
         page.get_by_role("button", name="Save Rules").click()
-
-        # Step 4: wait for the generated LTN code snippet to appear (3-min timeout)
-        expect(page.locator("[data-testid='stCode']")).to_be_visible(timeout=180_000)
+        expect(page.get_by_text("Rules saved")).to_be_visible(timeout=15_000)
         page.screenshot(path="/home/spyros/dev/repos/nsai-humaine/tests/snapshots/snap_06_rules_saved.png")
+
+    # ── Tab 4: Train ──────────────────────────────────────────────────────────
 
     def test_07_train_models(self, page_with_app: Page):
         page = page_with_app
+        click_tab(page, "Train")
 
         page.get_by_role("button", name="Train Models").click()
 

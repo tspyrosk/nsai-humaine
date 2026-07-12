@@ -130,32 +130,30 @@ class TestBCWSimpleViaProlog:
         expect(page.get_by_text("Imported 2 predicates")).to_be_visible(timeout=10_000)
         page.screenshot(path=str(SNAPSHOT_DIR / "snap_pl_04_prolog_imported.png"))
 
-    # ── Tab 3: Train — rules already saved by the import ─────────────────────
+    # ── Tab 3: Rules — rules already saved by the import ─────────────────────
 
-    def test_05_verify_rules_loaded_and_select_pill(self, page_with_app: Page):
+    def test_05_verify_rules_loaded(self, page_with_app: Page):
         page = page_with_app
-        click_tab(page, "Train")
 
-        # The importer sets rules_saved=True, so Step 2 must be visible
-        # without any further interaction (no Save Rules click needed).
-        expect(page.get_by_text("Step 2: Choose Training Method")).to_be_visible(timeout=10_000)
+        # The imported predicates appear in the always-visible list on the
+        # Predicates tab (each with a Remove button).
+        expect(page.locator("strong").filter(has_text="high_clump_thickness")).to_be_visible(timeout=10_000)
+        expect(page.locator("strong").filter(has_text="low_mitoses")).to_be_visible(timeout=10_000)
 
-        # The imported rule should be rendered as a pill matching the text
-        # the importer derives from the parsed rule tree.
-        pills_container = page.locator("[data-testid='stButtonGroup']")
-        expect(pills_container).to_be_visible(timeout=10_000)
-        pill = pills_container.locator("[data-testid='stBaseButton-pills']").filter(
-            has_text=EXPECTED_RULE_TEXT
-        )
-        expect(pill).to_be_visible(timeout=10_000)
-
-        # Select the pill so downstream explainability sees the rule in selected_rules.
-        pill.click()
-        wait_for_streamlit(page)
-        page.screenshot(path=str(SNAPSHOT_DIR / "snap_pl_05_rule_pill_selected.png"))
+        # The imported rule appears on the Rules tab with its encoded form
+        # (the text shows both as the rule title and in the "Understood as" caption).
+        click_tab(page, "Rules")
+        expect(page.get_by_text(EXPECTED_RULE_TEXT).first).to_be_visible(timeout=10_000)
+        page.screenshot(path=str(SNAPSHOT_DIR / "snap_pl_05_rules_loaded.png"))
 
     def test_06_train_models(self, page_with_app: Page):
         page = page_with_app
+        click_tab(page, "Train")
+
+        # The importer sets rules_saved=True, so the training step must be
+        # visible without any further interaction (no Save Rules click needed).
+        expect(page.get_by_text("Step 1: Choose Training Method")).to_be_visible(timeout=10_000)
+
         page.get_by_role("button", name="Train Models").click()
         expect(page.get_by_role("button", name="Evaluate Models")).to_be_visible(
             timeout=TRAIN_TIMEOUT

@@ -7,6 +7,7 @@ from predicates_definition.predicate_gen_utils import generate_python_code
 import predicates_definition.lambda_gen_utils as lambda_gen_utils
 from rules_parsing import (
     canonical,
+    text2rules_core,
     prolog_importer,
     datalog_importer,
     swrl_importer,
@@ -93,42 +94,89 @@ def load_rule_set() -> dict:
         return json.load(f)
 
 
-def save_and_parse_rules(selected_rules: list, predicates: list = None,
-                         composite_predicates: list = None) -> tuple:
+def parse_rule_text(nl_text: str, predicate_names: list) -> dict:
+    """Parse one natural-language rule into the canonical structured rule dict.
+
+    Called at rule-authoring time so the UI can immediately show the user the
+    encoded form of what the LLM understood. Raises on parse/LLM failure.
     """
-    Save rules and parse them into executable code.
+    return text2rules_core.parse_rule(nl_text, predicate_names)
 
-    Args:
-        selected_rules: List of natural-language rule strings
-        predicates: Simple predicate definitions (for persisting rules.json)
-        composite_predicates: Composite predicate definitions
 
-    Returns:
-        Tuple of (ltn_code, rules_code)
+def save_rules_artifacts(predicates: list, composite_predicates: list,
+                         rules: list) -> None:
+    """Write every rule artifact the training/publish steps consume.
+
+    ``rules`` is a list of ``{"text": <display string>, "structured": <rule dict>}``
+    entries. Produces ``rules_raw.txt``, ``ltn_rules.txt``, ``rules_only_rules.txt``
+    and the canonical ``rules.json`` — the same file interface the batch LLM
+    flow and the format importers have always written.
     """
-    # Save raw rules
-    with open(f"{OUTPUT_DIR}/rules_raw.txt", "w") as text_file:
-        text_file.write("\n".join(selected_rules))
+    structured = [r["structured"] for r in rules]
+    ltn_rule_strs = [canonical.rule_to_ltn(r) for r in structured]
+    py_rule_strs = [canonical.rule_to_python_lambda(r) for r in structured]
 
-    # Parse rules
-    os.system(f"python {TEXT2RULES_SCRIPT} --raw_rules_path={OUTPUT_DIR}/rules_raw.txt --output_path={OUTPUT_DIR}")
+    ltn_code = f"parsed_rules = lambda x, y: [{', '.join(ltn_rule_strs)}]"
+    rules_code = f"parsed_rules_python = lambda x, y: [{', '.join(py_rule_strs)}]"
 
-    # Read generated code
-    with open(f"{OUTPUT_DIR}/rules_only_rules.txt", "r") as file:
-        rules_code = file.read()
+    with open(f"{OUTPUT_DIR}/ltn_rules.txt", "w") as f:
+        f.write(ltn_code)
+    with open(f"{OUTPUT_DIR}/rules_only_rules.txt", "w") as f:
+        f.write(rules_code)
+    with open(f"{OUTPUT_DIR}/rules_raw.txt", "w") as f:
+        f.write("\n".join(r["text"] for r in rules))
 
-    with open(f"{OUTPUT_DIR}/ltn_rules.txt", "r") as file:
-        ltn_code = file.read()
+    save_rule_set(predicates, composite_predicates, structured)
 
-    # Persist the canonical rule set from the structured rules text2rules wrote,
-    # combined with the predicates/composites defined in this session.
-    structured_path = f"{OUTPUT_DIR}/rules_structured.json"
-    if os.path.exists(structured_path):
-        with open(structured_path) as f:
-            structured_rules = json.load(f)
-        save_rule_set(predicates or [], composite_predicates or [], structured_rules)
 
-    return ltn_code, rules_code
+def _structured_rule_names(rule: dict) -> set:
+    """Collect every predicate name referenced anywhere in a structured rule."""
+    names = set()
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("name"):
+            names.add(node["name"])
+        for key in ("if_part", "then_part", "arg1", "arg2"):
+            if node.get(key):
+                walk(node[key])
+
+    walk(rule)
+    return names
+
+
+def find_references(name: str, composite_predicates: list, rules: list) -> list:
+    """Return human-readable descriptions of everything referencing a predicate.
+
+    Used to block removal of a predicate that a composite expression or a
+    defined rule still depends on. Composite expressions store the original
+    predicate names; structured rules store the snake-cased names.
+    """
+    from utils import to_snake_case
+
+    referrers = []
+    for comp in composite_predicates:
+        if comp["name"] == name:
+            continue
+        leaves = set()
+
+        def collect(node):
+            if node["args"]:
+                for arg in node["args"]:
+                    collect(arg)
+            else:
+                leaves.add(node["name"])
+
+        collect(canonical.parse_composite_expression(comp["expression"]))
+        if name in leaves:
+            referrers.append(f"composite predicate '{comp['name']}'")
+
+    snake_name = to_snake_case(name)
+    for rule in rules:
+        if snake_name in _structured_rule_names(rule["structured"]):
+            referrers.append(f"rule '{rule['text']}'")
+    return referrers
 
 
 def _finalize_import(parsed: dict, target_column: str) -> dict:
@@ -161,22 +209,15 @@ def _finalize_import(parsed: dict, target_column: str) -> dict:
 
     # Build the LTN / Python-lambda rule files directly from the parsed JSON,
     # skipping the LLM round-trip that natural-language rules go through.
-    ltn_rule_strs = [canonical.rule_to_ltn(r) for r in parsed["rules"]]
-    py_rule_strs = [canonical.rule_to_python_lambda(r) for r in parsed["rules"]]
     rule_texts = [canonical.rule_to_text(r) for r in parsed["rules"]]
+    rules = [{"text": text, "structured": r}
+             for text, r in zip(rule_texts, parsed["rules"])]
+    save_rules_artifacts(parsed["predicates"], parsed["composite_predicates"], rules)
 
-    ltn_code = f"parsed_rules = lambda x, y: [{', '.join(ltn_rule_strs)}]"
-    rules_code = f"parsed_rules_python = lambda x, y: [{', '.join(py_rule_strs)}]"
-
-    with open(f"{OUTPUT_DIR}/ltn_rules.txt", "w") as f:
-        f.write(ltn_code)
-    with open(f"{OUTPUT_DIR}/rules_only_rules.txt", "w") as f:
-        f.write(rules_code)
-    with open(f"{OUTPUT_DIR}/rules_raw.txt", "w") as f:
-        f.write("\n".join(rule_texts))
-
-    # Persist the canonical rule set so the publish/export flow can serialize it.
-    save_rule_set(parsed["predicates"], parsed["composite_predicates"], parsed["rules"])
+    with open(f"{OUTPUT_DIR}/ltn_rules.txt") as f:
+        ltn_code = f.read()
+    with open(f"{OUTPUT_DIR}/rules_only_rules.txt") as f:
+        rules_code = f.read()
 
     return {
         **parsed,

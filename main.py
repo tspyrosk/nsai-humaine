@@ -12,7 +12,7 @@ from streamlit_shap import st_shap
 import shap
 import absl.logging
 import dataset.minio_utils as minio_utils
-from utils import remove_rules_and_predicates, remove_outputs, remove_rules
+from utils import remove_rules_and_predicates, remove_outputs, remove_rules, collect_predicate_names
 from dotenv import dotenv_values
 import io
 from paths import *
@@ -21,7 +21,7 @@ from paths import *
 from services import data_service, model_service, explanation_service, predicate_service, image_service, text_service, notebook_service, logging_service
 from services.image_service import QuotaExhaustedError as ImageQuotaError
 from services.text_service import QuotaExhaustedError as TextQuotaError
-from rules_parsing import rule_exporter
+from rules_parsing import rule_exporter, canonical
 from PIL import Image
 
 absl.logging.set_verbosity(absl.logging.ERROR)
@@ -58,10 +58,16 @@ def init_predicates_state():
         st.session_state.predicates = []
     if 'composite_predicates' not in st.session_state:
         st.session_state.composite_predicates = []
+    if 'predicates_saved' not in st.session_state:
+        st.session_state.predicates_saved = False
+    # Each rule is {"text": <natural-language string>, "structured": <canonical rule dict>}
+    if 'rules' not in st.session_state:
+        st.session_state.rules = []
 
 def reset_predicates_state():
     st.session_state.predicates = []
     st.session_state.composite_predicates = []
+    st.session_state.predicates_saved = False
 
 def init_state():
     if 'df' not in st.session_state:
@@ -134,6 +140,7 @@ def reset_state():
 if st.sidebar.button("Reset Rules"):
     remove_rules()
     st.session_state.rules = []
+    st.session_state.rules_saved = False
     logging_service.append_event(logging_service.make_event(
         "DomainExpert", "human", "reset all rules",
         correct=False, event_type="rule_reset"
@@ -141,6 +148,7 @@ if st.sidebar.button("Reset Rules"):
 if st.sidebar.button("Reset Rules and Predicates"):
     remove_rules_and_predicates()
     st.session_state.rules = []
+    st.session_state.rules_saved = False
     reset_predicates_state()
     logging_service.append_event(logging_service.make_event(
         "DomainExpert", "human", "reset all rules",
@@ -404,7 +412,7 @@ def create_metric_expander(results, result_name, start_expanded=False):
                 write_results(results, "LTN", result_name, comp_model_name="MLP")
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Load", "Predicates", "Train", "Explain", "Models"])
+tab1, tab2, tab_rules, tab3, tab4, tab5 = st.tabs(["Load", "Predicates", "Rules", "Train", "Explain", "Models"])
 
 with tab1:
     st.header("Upload Dataset")
@@ -969,7 +977,13 @@ with tab2:
                         )
                         st.session_state.predicates = result["predicates"]
                         st.session_state.composite_predicates = result["composite_predicates"]
-                        st.session_state.rules = result["rule_texts"]
+                        st.session_state.rules = [
+                            {"text": text, "structured": rule}
+                            for text, rule in zip(result["rule_texts"], result["rules"])
+                        ]
+                        # The importer wrote the full artifact set, so both steps
+                        # start out saved; any add/remove marks them dirty again.
+                        st.session_state.predicates_saved = True
                         st.session_state.rules_saved = True
                         logging_service.append_event(logging_service.make_event(
                             "DomainExpert", "human",
@@ -982,11 +996,340 @@ with tab2:
                             f"Imported {len(result['predicates'])} predicates, "
                             f"{len(result['composite_predicates'])} composite predicates, "
                             f"and {len(result['rule_texts'])} rules from .{ext} file. "
-                            "You can now proceed to the Train tab."
+                            "Review the predicates below and the rules on the Rules tab."
                         )
                         st.rerun()
                     except Exception as e:
                         st.error(f"Failed to import .{ext} file: {e}")
+
+    def name_exists(name):
+        return predicate_service.check_predicate_name_exists(
+            name,
+            st.session_state.predicates,
+            st.session_state.composite_predicates
+        )
+    
+    # Helper function to detect if a column is boolean (only 0 and 1 values)
+    def is_boolean_column(df, col_name):
+        """Check if a column contains only boolean values (0 and 1)."""
+        unique_vals = df[col_name].dropna().unique()
+        return set(unique_vals).issubset({0, 1, 0.0, 1.0, True, False})
+
+    def describe_predicate(pred):
+        col_name = pred.get('column_name', f"Column {pred['column_index']}")
+        if pred.get('is_boolean', False):
+            return f"{col_name} = True"
+        return f"{col_name} {pred['comparison']} {pred['threshold']}"
+
+    def remove_predicate(kind, index):
+        """Button callback: remove a predicate unless something still references it."""
+        collection = (st.session_state.predicates if kind == 'simple'
+                      else st.session_state.composite_predicates)
+        pred = collection[index]
+        references = predicate_service.find_references(
+            pred['name'],
+            st.session_state.composite_predicates,
+            st.session_state.rules,
+        )
+        if references:
+            # Callbacks run before the script renders, so stash the warning
+            # in session state for the upcoming render to display.
+            st.session_state.removal_blocked = (pred['name'], references)
+            return
+        collection.pop(index)
+        st.session_state.predicates_saved = False
+        logging_service.append_event(logging_service.make_event(
+            "DomainExpert", "human",
+            f"removed predicate: {pred['name']}",
+            event_type="predicate_removal"
+        ))
+
+    # ---- Always-visible list of defined predicates ----
+    st.subheader("Defined Predicates")
+
+    if st.session_state.get('removal_blocked'):
+        blocked_name, blocked_refs = st.session_state.pop('removal_blocked')
+        st.warning(
+            f"Cannot remove '{blocked_name}' — it is still used by "
+            f"{'; '.join(blocked_refs)}. Remove those first."
+        )
+
+    if not st.session_state.predicates and not st.session_state.composite_predicates:
+        st.caption("No predicates defined yet — add one below or import a rule file above.")
+    for i, pred in enumerate(st.session_state.predicates):
+        col_desc, col_btn = st.columns([6, 1])
+        col_desc.markdown(f"**{pred['name']}**: {describe_predicate(pred)}")
+        col_btn.button("Remove", key=f"del_pred_{i}",
+                       on_click=remove_predicate, args=('simple', i))
+    for i, comp in enumerate(st.session_state.composite_predicates):
+        col_desc, col_btn = st.columns([6, 1])
+        col_desc.markdown(f"**{comp['name']}**: {comp['expression']} *(composite)*")
+        col_btn.button("Remove", key=f"del_comp_{i}",
+                       on_click=remove_predicate, args=('composite', i))
+
+    if st.session_state.predicates or st.session_state.composite_predicates:
+        if not st.session_state.predicates_saved:
+            st.info("You have unsaved predicate changes — press Save Predicates when done.")
+        if st.button("Save Predicates", type="primary",
+                     disabled=st.session_state.target_column is None):
+            predicate_service.generate_and_save_predicates(
+                st.session_state.target_column,
+                st.session_state.predicates,
+                st.session_state.composite_predicates
+            )
+            st.session_state.predicates_saved = True
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"saved {len(st.session_state.predicates)} predicate(s) and "
+                f"{len(st.session_state.composite_predicates)} composite(s)",
+                event_type="predicate_definition"
+            ))
+            st.success("Predicates saved — continue on the Rules tab.")
+
+    st.divider()
+
+    # ---- Unified add-predicate form ----
+    st.subheader("Add Predicate")
+
+    if st.session_state.processed_df is None:
+        st.warning("Please load and apply a dataset first to create predicates.")
+    else:
+        pred_kind = st.segmented_control(
+            "Predicate type",
+            ["Simple", "Composite"],
+            default="Simple",
+            help="Simple predicates test a single feature; composite predicates "
+                 "combine two already-defined predicates with AND/OR/NOT."
+        )
+
+        if pred_kind == "Simple":
+            columns = st.session_state.processed_df.columns.tolist()
+
+            # Use ORIGINAL df (before normalization) to detect boolean columns
+            # processed_df is normalized with StandardScaler, so boolean 0/1 values
+            # become something like -1.0/1.0, breaking the boolean detection
+            original_df = st.session_state.df
+            if original_df is not None:
+                # Check column types using original (unnormalized) data
+                boolean_columns = set(
+                    col for col in columns
+                    if col in original_df.columns and is_boolean_column(original_df, col)
+                )
+            else:
+                # Fallback: assume no boolean columns if original df not available
+                boolean_columns = set()
+            numeric_columns = set(col for col in columns if col not in boolean_columns)
+
+            # Show info about column types
+            if boolean_columns and numeric_columns:
+                st.info(f"**Boolean features:** {len(boolean_columns)} | **Numeric features:** {len(numeric_columns)}")
+
+            # Select the column first (outside the form) so the fields can adapt
+            selected_column = st.selectbox(
+                "Select Feature Column",
+                columns,
+                key="predicate_column_select",
+                help="Select a column to create a predicate for"
+            )
+
+            is_boolean = selected_column in boolean_columns
+            column_index = columns.index(selected_column) if selected_column in columns else 0
+
+            if is_boolean:
+                # Boolean Predicate Form (simplified)
+                st.caption(f"📌 **{selected_column}** is a boolean feature (values: 0 or 1)")
+                with st.form("simple_predicate_form"):
+                    # Auto-fill predicate name with column name
+                    pred_name = st.text_input(
+                        "Predicate Name",
+                        value=selected_column,
+                        key="bool_pred_name",
+                        help="Name for this predicate (auto-filled with column name)"
+                    )
+
+                    submit_pred = st.form_submit_button("Add Predicate")
+
+                    if submit_pred and pred_name and not(name_exists(pred_name)):
+                        # Under the hood: boolean True = "> 0.5"
+                        st.session_state.predicates.append({
+                            'name': pred_name,
+                            'column_index': column_index,
+                            'threshold': 0.5,
+                            'comparison': 'Greater',
+                            'is_boolean': True,
+                            'column_name': selected_column
+                        })
+                        st.session_state.predicates_saved = False
+                        logging_service.append_event(logging_service.make_event(
+                            "DomainExpert", "human",
+                            f"defined predicate: {pred_name} (feature={selected_column}, boolean=True)",
+                            event_type="predicate_definition"
+                        ))
+                        st.rerun()
+                    elif submit_pred and name_exists(pred_name):
+                        st.warning(f"A predicate named '{pred_name}' already exists.")
+            else:
+                # Numeric Predicate Form (with threshold and comparison)
+                st.caption(f"**{selected_column}** is a numeric feature")
+                with st.form("simple_predicate_form"):
+                    # Auto-fill predicate name with column name
+                    pred_name = st.text_input(
+                        "Predicate Name",
+                        value=selected_column,
+                        key="num_pred_name",
+                        help="Name for this predicate (auto-filled with column name)"
+                    )
+                    threshold = st.number_input("Threshold Value", format="%f")
+                    comparison = st.selectbox("Comparison Operator", ["Greater", "Less", "Equal"])
+
+                    submit_pred = st.form_submit_button("Add Predicate")
+
+                    if submit_pred and pred_name and not(name_exists(pred_name)):
+                        st.session_state.predicates.append({
+                            'name': pred_name,
+                            'column_index': column_index,
+                            'threshold': threshold,
+                            'comparison': comparison,
+                            'is_boolean': False,
+                            'column_name': selected_column
+                        })
+                        st.session_state.predicates_saved = False
+                        logging_service.append_event(logging_service.make_event(
+                            "DomainExpert", "human",
+                            f"defined predicate: {pred_name} (feature={selected_column}, operator={comparison}, threshold={threshold})",
+                            event_type="predicate_definition"
+                        ))
+                        st.rerun()
+                    elif submit_pred and name_exists(pred_name):
+                        st.warning(f"A predicate named '{pred_name}' already exists.")
+
+        elif pred_kind == "Composite":
+            predicate_names = [pred['name'] for pred in st.session_state.predicates]
+
+            if not predicate_names:
+                st.warning("Please define at least one simple predicate first.")
+            else:
+                with st.form("composite_predicate_form"):
+                    comp_pred_name = st.text_input("Composite Predicate Name")
+
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        left_pred = st.selectbox("Left Predicate", predicate_names)
+                        left_unary = st.selectbox("Left Unary Operator", ["No Unary Predicate", "NOT"])
+
+                    with col2:
+                        right_pred = st.selectbox("Right Predicate", predicate_names)
+                        right_unary = st.selectbox("Right Unary Operator", ["No Unary Predicate", "NOT"])
+
+                    binary_op = st.selectbox("Binary Operator", ["AND", "OR"])
+
+                    submit_composite = st.form_submit_button("Add Predicate")
+
+                    if submit_composite and comp_pred_name and not(name_exists(comp_pred_name)):
+                        left_expr = f"Not({left_pred})" if left_unary == "NOT" else left_pred
+                        right_expr = f"Not({right_pred})" if right_unary == "NOT" else right_pred
+                        expression = f"{binary_op.capitalize()}({left_expr}, {right_expr})"
+                        st.session_state.composite_predicates.append({
+                            'name': comp_pred_name,
+                            'expression': expression
+                        })
+                        st.session_state.predicates_saved = False
+                        logging_service.append_event(logging_service.make_event(
+                            "DomainExpert", "human",
+                            f"defined composite predicate: {comp_pred_name} = {expression}",
+                            event_type="predicate_definition"
+                        ))
+                        st.rerun()
+                    elif submit_composite and name_exists(comp_pred_name):
+                        st.warning(f"A predicate or composite predicate named '{comp_pred_name}' already exists. Please choose another name.")
+
+with tab_rules:
+    st.header("Define Rules")
+
+    has_predicates = bool(st.session_state.predicates or st.session_state.composite_predicates)
+    if not has_predicates or not st.session_state.predicates_saved:
+        st.info("👆 Please define and save your predicates on the Predicates tab first.")
+    else:
+        rule_text = st.text_input(
+            "Enter rule in natural language:",
+            value="",
+            help="Example: 'if the clump thickness is high but mitoses is low "
+                 "then the tumor is malignant'. Reference the predicates you defined."
+        )
+
+        if st.button("Add Rule"):
+            if not rule_text.strip():
+                st.warning("Please enter a rule first.")
+            else:
+                predicate_names = collect_predicate_names(
+                    st.session_state.predicates,
+                    st.session_state.composite_predicates,
+                    st.session_state.target_column,
+                )
+                _t0 = time.time()
+                try:
+                    with st.spinner("Interpreting rule…"):
+                        structured = predicate_service.parse_rule_text(rule_text, predicate_names)
+                except Exception as e:
+                    st.error(f"Could not interpret the rule: {e}")
+                else:
+                    _rule_parse_latency_ms = round((time.time() - _t0) * 1000, 1)
+                    st.session_state.rules.append({"text": rule_text, "structured": structured})
+                    st.session_state.rules_saved = False
+                    logging_service.append_event(logging_service.make_event(
+                        "DomainExpert", "human",
+                        f"authored rule: {rule_text}",
+                        event_type="rule_authoring"
+                    ))
+                    logging_service.append_event(logging_service.make_event(
+                        "RuleParser_AI", "ai",
+                        f"parsed natural language rule to LTN formula: {canonical.rule_to_text(structured)}",
+                        latency_ms=_rule_parse_latency_ms,
+                        correct=True,
+                        event_type="decision"
+                    ))
+                    st.rerun()
+
+        def remove_rule(index):
+            removed = st.session_state.rules.pop(index)
+            st.session_state.rules_saved = False
+            logging_service.append_event(logging_service.make_event(
+                "DomainExpert", "human",
+                f"removed rule: {removed['text']}",
+                event_type="rule_removal"
+            ))
+
+        # ---- Always-visible list of defined rules ----
+        st.subheader("Defined Rules")
+        if not st.session_state.rules:
+            st.caption("No rules defined yet — describe one above in plain language.")
+        for i, rule in enumerate(st.session_state.rules):
+            col_desc, col_btn = st.columns([6, 1])
+            with col_desc:
+                st.markdown(f"**{rule['text']}**")
+                # The encoded form lets the user verify what the AI understood.
+                st.caption(f"Understood as: `{canonical.rule_to_text(rule['structured'])}`")
+            col_btn.button("Remove", key=f"del_rule_{i}", on_click=remove_rule, args=(i,))
+
+        if st.session_state.rules:
+            if not st.session_state.rules_saved:
+                st.info("You have unsaved rule changes — press Save Rules when done.")
+            if st.button("Save Rules", type="primary"):
+                predicate_service.save_rules_artifacts(
+                    st.session_state.predicates,
+                    st.session_state.composite_predicates,
+                    st.session_state.rules,
+                )
+                st.session_state.rules_saved = True
+                logging_service.append_event(logging_service.make_event(
+                    "DomainExpert", "human",
+                    f"saved {len(st.session_state.rules)} rule(s)",
+                    event_type="rule_authoring"
+                ))
+                st.success("Rules saved — continue on the Train tab.")
+
+    st.divider()
 
     # ---- Export predicates & rules to a file ----
     with st.expander("Export predicates & rules to a file"):
@@ -1018,273 +1361,12 @@ with tab2:
             except Exception as e:
                 st.error(f"Failed to export rules: {e}")
 
-    def display_predicates_and_generate_code():
-        st.subheader("Defined Predicates")
-        if st.session_state.predicates:
-            st.write("Simple Predicates:")
-            for pred in st.session_state.predicates:
-                if pred.get('is_boolean', False):
-                    # Display boolean predicates more cleanly
-                    col_name = pred.get('column_name', f"Column {pred['column_index']}")
-                    st.write(f"**{pred['name']}**: {col_name} = True")
-                else:
-                    # Display numeric predicates with threshold
-                    col_name = pred.get('column_name', f"Column {pred['column_index']}")
-                    st.write(f"**{pred['name']}**: {col_name} {pred['comparison']} {pred['threshold']}")
-
-        if st.session_state.composite_predicates:
-            st.write("Composite Predicates:")
-            for pred in st.session_state.composite_predicates:
-                st.write(f"{pred['name']}: {pred['expression']}")
-
-        if st.session_state.predicates or st.session_state.composite_predicates:
-            predicate_code, lambda_code, predicate_names = predicate_service.generate_and_save_predicates(
-                st.session_state.target_column,
-                st.session_state.predicates,
-                st.session_state.composite_predicates
-            )
-            st.subheader("Generated Code")
-            st.code(predicate_code + "\n" + lambda_code)
-
-    def name_exists(name):
-        return predicate_service.check_predicate_name_exists(
-            name,
-            st.session_state.predicates,
-            st.session_state.composite_predicates
-        )
-    
-    # Helper function to detect if a column is boolean (only 0 and 1 values)
-    def is_boolean_column(df, col_name):
-        """Check if a column contains only boolean values (0 and 1)."""
-        unique_vals = df[col_name].dropna().unique()
-        return set(unique_vals).issubset({0, 1, 0.0, 1.0, True, False})
-
-    # Simple Predicate Form
-    st.subheader("Create Simple Predicate")
-
-    if st.session_state.processed_df is not None:
-        columns = st.session_state.processed_df.columns.tolist()
-
-        # Use ORIGINAL df (before normalization) to detect boolean columns
-        # processed_df is normalized with StandardScaler, so boolean 0/1 values
-        # become something like -1.0/1.0, breaking the boolean detection
-        original_df = st.session_state.df
-        if original_df is not None:
-            # Check column types using original (unnormalized) data
-            boolean_columns = set(
-                col for col in columns
-                if col in original_df.columns and is_boolean_column(original_df, col)
-            )
-        else:
-            # Fallback: assume no boolean columns if original df not available
-            boolean_columns = set()
-        numeric_columns = set(col for col in columns if col not in boolean_columns)
-
-        # Show info about column types
-        if boolean_columns and numeric_columns:
-            st.info(f"**Boolean features:** {len(boolean_columns)} | **Numeric features:** {len(numeric_columns)}")
-
-        # Step 1: Select column first (outside form)
-        selected_column = st.selectbox(
-            "Select Feature Column",
-            columns,
-            key="predicate_column_select",
-            help="Select a column to create a predicate for"
-        )
-
-        # Determine column type
-        is_boolean = selected_column in boolean_columns
-        column_index = columns.index(selected_column) if selected_column in columns else 0
-
-        # Step 2: Show appropriate form based on column type
-        if is_boolean:
-            # Boolean Predicate Form (simplified)
-            st.caption(f"📌 **{selected_column}** is a boolean feature (values: 0 or 1)")
-            with st.form("simple_predicate_form"):
-                # Auto-fill predicate name with column name
-                pred_name = st.text_input(
-                    "Predicate Name",
-                    value=selected_column,
-                    key="bool_pred_name",
-                    help="Name for this predicate (auto-filled with column name)"
-                )
-
-                submit_pred = st.form_submit_button("Add Predicate")
-
-                if submit_pred and pred_name and not(name_exists(pred_name)):
-                    # Under the hood: boolean True = "> 0.5"
-                    st.session_state.predicates.append({
-                        'name': pred_name,
-                        'column_index': column_index,
-                        'threshold': 0.5,
-                        'comparison': 'Greater',
-                        'is_boolean': True,
-                        'column_name': selected_column
-                    })
-                    logging_service.append_event(logging_service.make_event(
-                        "DomainExpert", "human",
-                        f"defined predicate: {pred_name} (feature={selected_column}, boolean=True)",
-                        event_type="predicate_definition"
-                    ))
-                    display_predicates_and_generate_code()
-                elif submit_pred and name_exists(pred_name):
-                    st.warning(f"A predicate named '{pred_name}' already exists.")
-        else:
-            # Numeric Predicate Form (with threshold and comparison)
-            st.caption(f"**{selected_column}** is a numeric feature")
-            with st.form("simple_predicate_form"):
-                # Auto-fill predicate name with column name
-                pred_name = st.text_input(
-                    "Predicate Name",
-                    value=selected_column,
-                    key="num_pred_name",
-                    help="Name for this predicate (auto-filled with column name)"
-                )
-                threshold = st.number_input("Threshold Value", format="%f")
-                comparison = st.selectbox("Comparison Operator", ["Greater", "Less", "Equal"])
-
-                submit_pred = st.form_submit_button("Add Predicate")
-
-                if submit_pred and pred_name and not(name_exists(pred_name)):
-                    st.session_state.predicates.append({
-                        'name': pred_name,
-                        'column_index': column_index,
-                        'threshold': threshold,
-                        'comparison': comparison,
-                        'is_boolean': False,
-                        'column_name': selected_column
-                    })
-                    logging_service.append_event(logging_service.make_event(
-                        "DomainExpert", "human",
-                        f"defined predicate: {pred_name} (feature={selected_column}, operator={comparison}, threshold={threshold})",
-                        event_type="predicate_definition"
-                    ))
-                    display_predicates_and_generate_code()
-                elif submit_pred and name_exists(pred_name):
-                    st.warning(f"A predicate named '{pred_name}' already exists.")
-    else:
-        # Fallback when no data is loaded
-        st.warning("Please load and apply a dataset first to create predicates.")
-        with st.form("simple_predicate_form"):
-            pred_name = st.text_input("Predicate Name")
-            column_index = st.number_input("Column Index", min_value=0, step=1)
-            threshold = st.number_input("Threshold Value", format="%f")
-            comparison = st.selectbox("Comparison Operator", ["Greater", "Less", "Equal"])
-            submit_simple = st.form_submit_button("Add Predicate")
-
-            if submit_simple and pred_name and not(name_exists(pred_name)):
-                st.session_state.predicates.append({
-                    'name': pred_name,
-                    'column_index': column_index,
-                    'threshold': threshold,
-                    'comparison': comparison,
-                    'is_boolean': False
-                })
-                logging_service.append_event(logging_service.make_event(
-                    "DomainExpert", "human",
-                    f"defined predicate: {pred_name} (column_index={column_index}, operator={comparison}, threshold={threshold})",
-                    event_type="predicate_definition"
-                ))
-                display_predicates_and_generate_code()
-            elif name_exists(pred_name):
-                st.warning(f"A predicate named '{pred_name}' already exists.")
-
-
-    # Composite Predicate Form
-    st.subheader("Create Composite Predicate")
-    with st.form("composite_predicate_form"):
-        comp_pred_name = st.text_input("Composite Predicate Name")
-        
-        # Get list of existing predicate names
-        predicate_names = [pred['name'] for pred in st.session_state.predicates]
-        
-        if predicate_names:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                left_pred = st.selectbox("Left Predicate", predicate_names)
-                left_unary = st.selectbox("Left Unary Operator", ["No Unary Predicate", "NOT"])
-            
-            with col2:
-                right_pred = st.selectbox("Right Predicate", predicate_names)
-                right_unary = st.selectbox("Right Unary Operator", ["No Unary Predicate", "NOT"])
-            
-            binary_op = st.selectbox("Binary Operator", ["AND", "OR"])
-            
-            # Construct expression
-            left_expr = f"Not({left_pred})" if left_unary == "NOT" else left_pred
-            right_expr = f"Not({right_pred})" if right_unary == "NOT" else right_pred
-            expression = f"{binary_op.capitalize()}({left_expr}, {right_expr})"
-            
-            st.text_input("Generated Expression", value=expression, disabled=True)
-        else:
-            st.warning("Please define at least one simple predicate first.")
-            expression = ""
-        
-        submit_composite = st.form_submit_button("Add Composite Predicate")
-        
-        if submit_composite and comp_pred_name and predicate_names and not(name_exists(comp_pred_name)):
-            st.session_state.composite_predicates.append({
-                'name': comp_pred_name,
-                'expression': expression
-            })
-            logging_service.append_event(logging_service.make_event(
-                "DomainExpert", "human",
-                f"defined composite predicate: {comp_pred_name} = {expression}",
-                event_type="predicate_definition"
-            ))
-            #st.success(f"Composite Predicate {comp_pred_name} added!")
-            display_predicates_and_generate_code()   
-        elif name_exists(comp_pred_name):
-            st.warning(f"A predicate or composite predicate named '{pred_name}' already exists. Please choose another name.")
-
 with tab3:
     st.header("Train Models")
 
-    # Step 1: Define and Save Rules First
-    st.subheader("Step 1: Define Rules")
-
-    rule_text = st.text_input("Enter rule:", value="")
-    if 'rules' not in st.session_state:
-        st.session_state.rules = []
-
-    add_rule = st.button("Add Rule")
-
-    if add_rule:
-        st.session_state.rules.append(rule_text)
-        logging_service.append_event(logging_service.make_event(
-            "DomainExpert", "human",
-            f"authored rule: {rule_text}",
-            event_type="rule_authoring"
-        ))
-
-    selected_rules = st.pills("Rules Entered:", st.session_state.rules, selection_mode="multi")
-
-    save_rules = st.button("Save Rules")
-    if save_rules:
-        _t0 = time.time()
-        ltn_code, rules_code = predicate_service.save_and_parse_rules(
-            selected_rules,
-            st.session_state.predicates,
-            st.session_state.composite_predicates,
-        )
-        _rule_parse_latency_ms = round((time.time() - _t0) * 1000, 1)
-        st.session_state.rules_saved = True
-        logging_service.append_event(logging_service.make_event(
-            "RuleParser_AI", "ai",
-            f"parsed {len(selected_rules)} natural language rule(s) to LTN formula",
-            latency_ms=_rule_parse_latency_ms,
-            correct=True,
-            event_type="decision"
-        ))
-        st.subheader("Generated Code")
-        st.code(ltn_code + "\n" + rules_code)
-
-    st.divider()
-
-    # Step 2: Choose Training Method (only show after rules are saved)
+    # Training is gated on a finalized rule set from the Rules tab.
     if st.session_state.get('rules_saved', False):
-        st.subheader("Step 2: Choose Training Method")
+        st.subheader("Step 1: Choose Training Method")
 
         col1, col2 = st.columns(2)
 
@@ -1329,8 +1411,8 @@ with tab3:
 
         st.divider()
 
-        # Step 3: Unified Model Evaluation
-        st.subheader("Step 3: Model Evaluation")
+        # Step 2: Unified Model Evaluation
+        st.subheader("Step 2: Model Evaluation")
 
         available_models = model_service.get_available_models()
         if available_models:
@@ -1374,7 +1456,7 @@ with tab3:
         else:
             st.info("No trained models found. Use one of the training methods above.")
     else:
-        st.info("👆 Please define and save your rules first to proceed with training.")
+        st.info("👆 Please define and save your rules on the Rules tab first to proceed with training.")
 
 with tab4:
     if st.session_state.X_test is not None:
@@ -1440,7 +1522,7 @@ with tab4:
                 x, y,
                 st.session_state.X_train,
                 st.session_state.target_column,
-                selected_rules,
+                [r["text"] for r in st.session_state.rules],
                 dataset_description=st.session_state.dataset_description
             )
 
