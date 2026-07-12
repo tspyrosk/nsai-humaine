@@ -961,8 +961,6 @@ with tab2:
             "Prolog (.pl), Datalog (.dl), SWRL (.swrl), CLIPS/Jess (.clp), "
             "Drools DRL (.drl), or a pickled/joblib scikit-learn decision tree "
             "(.pkl/.joblib). The format is detected from the file extension. "
-            "See the matching `tests/fixtures/example_rules.*` files for the "
-            "expected format."
         )
         rules_upload = st.file_uploader(
             "Upload rule file",
