@@ -117,7 +117,11 @@ def init_state():
     if 'session_start_time' not in st.session_state:
         st.session_state.session_start_time = time.time()
     if 'run_id' not in st.session_state:
-        st.session_state.run_id = uuid.uuid4().hex[:12]
+        session_ts = time.strftime(
+            "%Y%m%d-%H%M%S",
+            time.localtime(st.session_state.session_start_time)
+        )
+        st.session_state.run_id = f"{session_ts}_{uuid.uuid4().hex[:6]}"
     init_predicates_state()
     st.cache_data.clear()
 
@@ -1786,9 +1790,11 @@ with tab4:
         st.markdown(f'**True label:** {y.item()}')
         predict = st.button("Predict!")
         if predict:
+            interaction_id = f"diabetes_case_sample{sample_id}"
             logging_service.append_event(logging_service.make_event(
                 "DomainExpert", "human",
                 f"triggered prediction for sample_id={sample_id}",
+                interaction_id=interaction_id,
                 event_type="info"
             ))
             explanation = explanation_service.predict_and_explain(
@@ -1807,6 +1813,7 @@ with tab4:
             logging_service.append_event(logging_service.make_event(
                 "LTN_Classifier_AI", "ai",
                 f"classifying sample_id={sample_id}",
+                interaction_id=interaction_id,
                 latency_ms=explanation['prediction_latency_ms'],
                 duration_s=round(explanation['prediction_latency_ms'] / 1000, 3),
                 probs={k: round(float(v), 4) for k, v in _scores.items()},
@@ -1815,11 +1822,13 @@ with tab4:
             logging_service.append_event(logging_service.make_event(
                 "SHAP_Explainer_AI", "ai",
                 f"generated feature importance (top-3: {', '.join(explanation['important_features'])})",
+                interaction_id=interaction_id,
                 event_type="info"
             ))
             logging_service.append_event(logging_service.make_event(
                 "XAI_RAG_AI", "ai",
                 f"generated natural language explanation for prediction: {_predicted_class}",
+                interaction_id=interaction_id,
                 latency_ms=explanation['rag_latency_ms'],
                 duration_s=round(explanation['rag_latency_ms'] / 1000, 3),
                 event_type="decision"
@@ -1847,6 +1856,7 @@ with tab4:
             logging_service.append_event(logging_service.make_event(
                 "DomainExpert", "human",
                 f"reviewed AI prediction and explanation for sample_id={sample_id}",
+                interaction_id=interaction_id,
                 correct=True,
                 event_type="decision"
             ))
