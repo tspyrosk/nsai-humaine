@@ -10,23 +10,35 @@ import streamlit as st
 
 from dataset import minio_utils
 
+PILOT_TAG = "smart-healthcare-diabetes"
+AI_MODEL_VERSION = "neurosymbolic-v0"
+
 
 def _elapsed() -> float:
     start = st.session_state.get("session_start_time", time.time())
     return round(time.time() - start, 3)
 
 
-def make_event(agent: str, actor_type: str, action: str, **kwargs) -> dict:
+def make_event(agent: str, actor_type: str, action: str,
+               interaction_id: str = None, **kwargs) -> dict:
     event = {
         "t": _elapsed(),
-        "agent": agent,
         "actor_type": actor_type,
         "action": action,
     }
-    for key in ("latency_ms", "duration_s", "correct", "probs",
-                "surrogate_probs", "surrogate_action", "event_type"):
+    if interaction_id:
+        event["interaction_id"] = interaction_id
+    for key in ("latency_ms", "duration_s", "correct",
+                "surrogate_probs", "surrogate_action"):
         if key in kwargs:
             event[key] = kwargs[key]
+    # Fields outside the benchmarking-suite schema go in payload so the
+    # evaluation pipeline preserves them instead of silently dropping them.
+    payload = {"agent": agent}
+    for key in ("event_type", "probs"):
+        if key in kwargs:
+            payload[key] = kwargs[key]
+    event["payload"] = payload
     return event
 
 
@@ -54,10 +66,31 @@ def publish_events(token: str, bucket: str, run_id: str):
             return float(obj)
         raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
-    tmp_path = os.path.join(tempfile.gettempdir(), f"{run_id}_events.jsonl")
-    with open(tmp_path, "w") as f:
-        for event in events:
-            f.write(json.dumps(event, default=_default) + "\n")
+    # Every event needs an interaction_id for per-case metrics. Setup events
+    # (predicates, rules, training) are part of the cycle that leads to the
+    # first predicted case, so they inherit its id; if no prediction was made
+    # yet, fall back to a session-level case id.
+    default_id = next(
+        (e["interaction_id"] for e in events if e.get("interaction_id")),
+        f"diabetes_case_{run_id}",
+    )
+    for event in events:
+        event.setdefault("interaction_id", default_id)
 
-    object_name = f"benchmarking-logs/{run_id}/events.jsonl"
+    document = {
+        "logs": [
+            {
+                "session_id": run_id,
+                "pilot_tag": PILOT_TAG,
+                "ai_model_version": AI_MODEL_VERSION,
+                "decisions": events,
+            }
+        ]
+    }
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"{run_id}_events.json")
+    with open(tmp_path, "w") as f:
+        json.dump(document, f, default=_default, indent=2)
+
+    object_name = f"benchmarking-logs/{run_id}/events.json"
     minio_utils.minio_upload(token, bucket, object_name, tmp_path)
