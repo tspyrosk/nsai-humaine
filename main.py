@@ -908,8 +908,8 @@ with tab1:
                     merged_sample = reduction_stats.get('merged_clusters_sample', {})
                     if merged_sample:
                         st.write("**Sample merged tags:**")
-                        for canonical, merged in list(merged_sample.items())[:3]:
-                            st.write(f"  • {canonical} ← {', '.join(merged)}")
+                        for canonical_tag, merged in list(merged_sample.items())[:3]:
+                            st.write(f"  • {canonical_tag} ← {', '.join(merged)}")
 
                 st.write(f"**Selected tags:** {', '.join(meta['all_tags'][:15])}{'...' if len(meta['all_tags']) > 15 else ''}")
 
