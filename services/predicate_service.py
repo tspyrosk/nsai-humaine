@@ -51,6 +51,42 @@ def generate_and_save_predicates(target_column: str, predicates: list,
     return predicate_code, lambda_code, predicate_names
 
 
+def bind_predicate_columns(predicates: list, feature_names: list) -> list:
+    """Bind each predicate's column_index to a name in the CURRENT feature matrix.
+
+    Imported rule files carry raw column indices resolved against whichever
+    feature matrix produced them. For image and text datasets the tag vocabulary
+    is rebuilt on every extraction run, so both the number of tag columns and
+    their ordering change - which silently invalidates every index in the file
+    (and shifts the trailing image/statistical features too).
+
+    An out-of-range index only surfaces at training time, as an IndexError from
+    the exec'd predicates.txt; an index that is merely *wrong* never surfaces at
+    all and trains against the wrong feature. So: reject the former, and record
+    ``column_name`` for the latter so the UI shows which column each predicate
+    actually resolves to.
+
+    Args:
+        predicates: Simple predicate dicts; mutated in place to add column_name.
+        feature_names: Column names of the current feature matrix, in order.
+
+    Returns:
+        A list of human-readable problems. Empty means every index is in range.
+    """
+    problems = []
+    column_count = len(feature_names)
+    for predicate in predicates:
+        index = predicate.get("column_index")
+        if not isinstance(index, int) or not 0 <= index < column_count:
+            problems.append(
+                f"`{predicate.get('name', '?')}` points at column {index}, but this "
+                f"dataset has {column_count} columns (valid range 0-{column_count - 1})."
+            )
+        else:
+            predicate["column_name"] = feature_names[index]
+    return problems
+
+
 def check_predicate_name_exists(name: str, predicates: list,
                                  composite_predicates: list) -> bool:
     """

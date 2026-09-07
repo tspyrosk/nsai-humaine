@@ -5,6 +5,15 @@ import shutil
 from paths import *
 
 def normalize_value(features, feature_index, value):
+    column_count = features.shape[1]
+    if not 0 <= feature_index < column_count:
+        raise IndexError(
+            f"Predicate refers to column {feature_index}, but the training matrix "
+            f"has {column_count} columns. The predicates were defined against a "
+            f"different feature matrix - re-import the rule file (or re-pick the "
+            f"columns in the predicate editor) now that the dataset has changed. "
+            f"Column names for this run are in {FEATURE_NAMES_PATH}."
+        )
     feature_column = features[:, feature_index]
 
     mean = np.mean(feature_column)
