@@ -77,6 +77,23 @@ def reset_predicates_state():
     st.session_state.editing_pred = None
     st.session_state.editing_rule = None
 
+def start_new_benchmarking_run():
+    """Begin a fresh benchmarking session: empty event buffer, new id, new clock.
+
+    One run == one dataset worked through end to end. Event `t` values are
+    relative to session_start_time and publish_events() writes the whole buffer
+    to benchmarking-logs/<run_id>/events.json, so carrying any of these three
+    across a dataset switch would conflate both datasets into a single log.
+    """
+    st.session_state.log_events = []
+    st.session_state.session_start_time = time.time()
+    session_ts = time.strftime(
+        "%Y%m%d-%H%M%S",
+        time.localtime(st.session_state.session_start_time)
+    )
+    st.session_state.run_id = f"{session_ts}_{uuid.uuid4().hex[:6]}"
+
+
 def init_state():
     if 'df' not in st.session_state:
         st.session_state.df = None
@@ -112,16 +129,8 @@ def init_state():
         st.session_state.minio_token = None
     if 'rules_saved' not in st.session_state:
         st.session_state.rules_saved = False
-    if 'log_events' not in st.session_state:
-        st.session_state.log_events = []
-    if 'session_start_time' not in st.session_state:
-        st.session_state.session_start_time = time.time()
     if 'run_id' not in st.session_state:
-        session_ts = time.strftime(
-            "%Y%m%d-%H%M%S",
-            time.localtime(st.session_state.session_start_time)
-        )
-        st.session_state.run_id = f"{session_ts}_{uuid.uuid4().hex[:6]}"
+        start_new_benchmarking_run()
     init_predicates_state()
     st.cache_data.clear()
 
@@ -147,6 +156,10 @@ def reset_state():
     st.session_state.rules = []
     st.session_state.rules_saved = False
     reset_predicates_state()
+    # A reset means a different dataset is coming, so the benchmarking log
+    # starts over too - otherwise the previous dataset's events are republished
+    # under this one's session and its interaction_ids leak onto them.
+    start_new_benchmarking_run()
     st.cache_data.clear()
 
 if st.sidebar.button("Reset Rules"):
@@ -444,21 +457,38 @@ with tab1:
                 _json.dump({"data_type": "tabular", "tags": [], "image_feature_names": []}, _f)
 
     elif upload_method == "MinIO Path":
-        minio_path = st.text_input("Enter MinIO Path")
+        minio_path = st.text_input("Enter MinIO Path", placeholder="bucket/path/to/file.csv")
         if st.button("Load from MinIO"):
             if minio_path:
-                try:
-                    bucket = minio_path.split("/")[0]
-                    path = "/".join(minio_path.split("/")[1:])
-                    print(f"Reading from MinIO. Bucket: {bucket}, rePath: {path}")
-                    minio_utils.minio_download(st.session_state.minio_token, bucket, path, INPUT_CSV)
-                    st.session_state.df = pd.read_csv(INPUT_CSV)
-                    st.session_state.dataset_type = "csv"
-                    import json as _json
-                    with open(TAG_VOCABULARY_PATH, "w") as _f:
-                        _json.dump({"data_type": "tabular", "tags": [], "image_feature_names": []}, _f)
-                except Exception as e:
-                    st.error(f"Error loading data from MinIO: {str(e)}")
+                bucket = minio_path.strip().strip("/").split("/")[0]
+                path = "/".join(minio_path.strip().strip("/").split("/")[1:])
+                if not path:
+                    st.error(
+                        "The MinIO path needs a bucket **and** an object, for example "
+                        "`smart-healthcare-diabetes-data/20250429_diabetes.csv`. "
+                        f"Got only `{bucket}`."
+                    )
+                else:
+                    try:
+                        print(f"Reading from MinIO. Bucket: {bucket}, rePath: {path}")
+                        minio_utils.minio_download(st.session_state.minio_token, bucket, path, INPUT_CSV)
+                    except minio_utils.MinioError as e:
+                        st.error(e.user_message())
+                    except Exception as e:
+                        st.error(f"Unexpected error downloading from MinIO: {e}")
+                    else:
+                        try:
+                            st.session_state.df = pd.read_csv(INPUT_CSV)
+                        except Exception as e:
+                            st.error(
+                                f"Downloaded `{bucket}/{path}` but could not read it as CSV: {e}"
+                            )
+                        else:
+                            st.session_state.dataset_type = "csv"
+                            import json as _json
+                            with open(TAG_VOCABULARY_PATH, "w") as _f:
+                                _json.dump({"data_type": "tabular", "tags": [], "image_feature_names": []}, _f)
+                            st.success(f"Loaded `{bucket}/{path}` ({len(st.session_state.df)} rows)")
             else:
                 st.warning("Please enter a valid MinIO path.")
 
@@ -825,52 +855,70 @@ with tab1:
         st.subheader("Dataset Preview")
         st.write(st.session_state.df.head())
 
-        # Dataset description section - helps make prompts domain-agnostic
+        # Dataset description section - helps make prompts domain-agnostic.
+        # The text and image upload flows already ask these same questions up front
+        # (their answers steer tag extraction), so when they have been answered this
+        # collapses to a summary instead of asking a second time. It stays expandable
+        # so the answers remain editable, and CSV/MinIO uploads - which have no
+        # earlier prompt - still get the full form.
         st.divider()
-        st.subheader("Dataset Description")
-        st.info("Provide context about your dataset. This helps generate more relevant explanations and feature extraction.")
+        _saved_description = st.session_state.dataset_description or {}
+        _description_answered = any(
+            _saved_description.get(field) for field in
+            ('domain', 'row_description', 'prediction_target', 'class_descriptions')
+        )
 
-        col_desc1, col_desc2 = st.columns(2)
-        with col_desc1:
-            dataset_domain = st.text_area(
-                "What is this dataset about?",
-                value=st.session_state.dataset_description.get('domain', '') if st.session_state.dataset_description else '',
-                placeholder="e.g., Medical diagnosis data, Manufacturing quality control, SMS spam detection, Customer churn prediction",
-                help="Briefly describe the domain and purpose of this dataset."
+        if _description_answered:
+            _description_section = st.expander(
+                "✅ Dataset Description — captured during upload, expand to review or edit"
             )
-            row_description = st.text_area(
-                "What does each row represent?",
-                value=st.session_state.dataset_description.get('row_description', '') if st.session_state.dataset_description else '',
-                placeholder="e.g., A patient's medical record, A product from the assembly line, An SMS message, A customer account",
-                help="Describe what a single data point or observation represents."
-            )
-        with col_desc2:
-            prediction_target = st.text_area(
-                "What are you trying to predict?",
-                value=st.session_state.dataset_description.get('prediction_target', '') if st.session_state.dataset_description else '',
-                placeholder="e.g., Whether the patient has diabetes, Whether the product is defective, Whether the message is spam",
-                help="Describe the classification goal."
-            )
-            class_descriptions = st.text_area(
-                "Describe the classes (optional)",
-                value=st.session_state.dataset_description.get('class_descriptions', '') if st.session_state.dataset_description else '',
-                placeholder="e.g., Class 0 = Healthy, Class 1 = Diabetic",
-                help="Provide meaning for each class label."
-            )
+        else:
+            st.subheader("Dataset Description")
+            st.info("Provide context about your dataset. This helps generate more relevant explanations and feature extraction.")
+            _description_section = st.container()
 
-        if st.button("Save Dataset Description"):
-            st.session_state.dataset_description = {
-                'domain': dataset_domain,
-                'row_description': row_description,
-                'prediction_target': prediction_target,
-                'class_descriptions': class_descriptions
-            }
-            logging_service.append_event(logging_service.make_event(
-                "DomainExpert", "human",
-                f"saved dataset description: domain={dataset_domain}, target={prediction_target}",
-                event_type="info"
-            ))
-            st.success("Dataset description saved!")
+        with _description_section:
+            col_desc1, col_desc2 = st.columns(2)
+            with col_desc1:
+                dataset_domain = st.text_area(
+                    "What is this dataset about?",
+                    value=st.session_state.dataset_description.get('domain', '') if st.session_state.dataset_description else '',
+                    placeholder="e.g., Medical diagnosis data, Manufacturing quality control, SMS spam detection, Customer churn prediction",
+                    help="Briefly describe the domain and purpose of this dataset."
+                )
+                row_description = st.text_area(
+                    "What does each row represent?",
+                    value=st.session_state.dataset_description.get('row_description', '') if st.session_state.dataset_description else '',
+                    placeholder="e.g., A patient's medical record, A product from the assembly line, An SMS message, A customer account",
+                    help="Describe what a single data point or observation represents."
+                )
+            with col_desc2:
+                prediction_target = st.text_area(
+                    "What are you trying to predict?",
+                    value=st.session_state.dataset_description.get('prediction_target', '') if st.session_state.dataset_description else '',
+                    placeholder="e.g., Whether the patient has diabetes, Whether the product is defective, Whether the message is spam",
+                    help="Describe the classification goal."
+                )
+                class_descriptions = st.text_area(
+                    "Describe the classes (optional)",
+                    value=st.session_state.dataset_description.get('class_descriptions', '') if st.session_state.dataset_description else '',
+                    placeholder="e.g., Class 0 = Healthy, Class 1 = Diabetic",
+                    help="Provide meaning for each class label."
+                )
+
+            if st.button("Save Dataset Description"):
+                st.session_state.dataset_description = {
+                    'domain': dataset_domain,
+                    'row_description': row_description,
+                    'prediction_target': prediction_target,
+                    'class_descriptions': class_descriptions
+                }
+                logging_service.append_event(logging_service.make_event(
+                    "DomainExpert", "human",
+                    f"saved dataset description: domain={dataset_domain}, target={prediction_target}",
+                    event_type="info"
+                ))
+                st.success("Dataset description saved!")
 
         # For image datasets, show metadata
         if st.session_state.dataset_type == "image" and st.session_state.image_metadata:
@@ -985,6 +1033,23 @@ with tab2:
                             rules_upload.getvalue(),
                             st.session_state.target_column,
                         )
+                        # Indices in the file were resolved against whatever
+                        # feature matrix produced it. Check them against THIS
+                        # dataset before accepting, so a stale file fails here
+                        # with a readable message instead of as an IndexError
+                        # inside the exec'd predicates.txt during training.
+                        column_problems = predicate_service.bind_predicate_columns(
+                            result["predicates"],
+                            st.session_state.processed_df.columns.tolist(),
+                        )
+                        if column_problems:
+                            raise ValueError(
+                                "the column indices do not match this dataset - "
+                                + " ".join(column_problems)
+                                + " Rule files are only valid for the feature matrix "
+                                "they were written against; for image and text datasets "
+                                "re-extracting tags renumbers every column."
+                            )
                         st.session_state.predicates = result["predicates"]
                         st.session_state.composite_predicates = result["composite_predicates"]
                         st.session_state.rules = [
@@ -1689,7 +1754,17 @@ with tab3:
         st.divider()
 
         # Step 2: Unified Model Evaluation
-        st.subheader("Step 2: Model Evaluation")
+        _eval_col, _refresh_col = st.columns([4, 1], vertical_alignment="bottom")
+        with _eval_col:
+            st.subheader("Step 2: Model Evaluation")
+        with _refresh_col:
+            # Models trained in JupyterLab are written straight to OUTPUT_DIR without
+            # Streamlit ever rerunning, so they stay invisible here until something
+            # triggers a rerun. This button is that trigger - the click itself reruns
+            # the script, and the scan below then picks the new files up.
+            if st.button("🔄 Refresh", use_container_width=True,
+                         help="Re-scan for models trained in JupyterLab"):
+                st.toast("Checked for newly trained models.")
 
         available_models = model_service.get_available_models()
         if available_models:
@@ -1731,7 +1806,10 @@ with tab3:
                 else:
                     st.warning("No models could be evaluated.")
         else:
-            st.info("No trained models found. Use one of the training methods above.")
+            st.info(
+                "No trained models found. Use one of the training methods above - "
+                "if you just trained in JupyterLab, hit 🔄 Refresh to pick the models up."
+            )
     else:
         st.info("👆 Please define and save your rules on the Predicates & Rules tab first to proceed with training.")
 
