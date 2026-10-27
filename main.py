@@ -82,8 +82,9 @@ def start_new_benchmarking_run():
 
     One run == one dataset worked through end to end. Event `t` values are
     relative to session_start_time and publish_events() writes the whole buffer
-    to benchmarking-logs/<run_id>/events.json, so carrying any of these three
-    across a dataset switch would conflate both datasets into a single log.
+    to benchmarking-suite/smart-healthcare-diabetes/<run_id>_events.json, so
+    carrying any of these three across a dataset switch would conflate both
+    datasets into a single log.
     """
     st.session_state.log_events = []
     st.session_state.session_start_time = time.time()
@@ -373,7 +374,7 @@ def publish_model_dialog():
                 "DomainExpert", "human", "approved model publish to MinIO",
                 correct=True, event_type="decision"
             ))
-            logging_service.publish_events(token, MINIO_BUCKET, st.session_state.run_id)
+            logging_service.publish_events(token, st.session_state.run_id)
             st.success(f"Model published successfully (version: {version}).")
             st.rerun()
     with col2:
@@ -1799,7 +1800,6 @@ with tab3:
                     ))
                     logging_service.publish_events(
                         st.session_state.get("minio_token"),
-                        MINIO_BUCKET,
                         st.session_state.run_id
                     )
                     st.success("Models ready! Use the Explain tab to make predictions.")

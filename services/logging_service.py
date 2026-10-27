@@ -13,6 +13,12 @@ from dataset import minio_utils
 PILOT_TAG = "smart-healthcare-diabetes"
 AI_MODEL_VERSION = "neurosymbolic-v0"
 
+# The benchmarking suite reads every log it finds directly under
+# <BENCHMARKING_BUCKET>/<BENCHMARKING_PREFIX>, so logs are written flat there -
+# one object per run, no per-run subfolder.
+BENCHMARKING_BUCKET = "benchmarking-suite"
+BENCHMARKING_PREFIX = PILOT_TAG
+
 
 def _elapsed() -> float:
     start = st.session_state.get("session_start_time", time.time())
@@ -48,7 +54,7 @@ def append_event(event: dict):
     st.session_state.log_events.append(event)
 
 
-def publish_events(token: str, bucket: str, run_id: str):
+def publish_events(token: str, run_id: str):
     events = st.session_state.get("log_events", [])
     if not events:
         return
@@ -92,5 +98,5 @@ def publish_events(token: str, bucket: str, run_id: str):
     with open(tmp_path, "w") as f:
         json.dump(document, f, default=_default, indent=2)
 
-    object_name = f"benchmarking-logs/{run_id}/events.json"
-    minio_utils.minio_upload(token, bucket, object_name, tmp_path)
+    object_name = f"{BENCHMARKING_PREFIX}/{run_id}_events.json"
+    minio_utils.minio_upload(token, BENCHMARKING_BUCKET, object_name, tmp_path)
